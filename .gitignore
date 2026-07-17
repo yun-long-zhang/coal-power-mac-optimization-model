@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+backup/
+repec/
+other/
+*.pyc
+.env/
+.venv/
+
+# Data files (large)
+*.xlsx
+*.csv
+*.docx
+
+# Output figures & temp
+*.png
+*.jpg
+*.pdf
+data/*.csv
+data/*.xlsx
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
