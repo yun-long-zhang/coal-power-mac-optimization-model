@@ -6,16 +6,20 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from r2_result_columns import add_net_abatement_columns
 from matplotlib.text import Text
 
 from plot_export_utils import save_figure_bundle
 
 
 DATA_DIR_NAME = "data"
-BASELINE_CURVE_NAME = "gurobi_original_curve.csv"
-BASELINE_RESULTS_NAME = "gurobi_original_results.xlsx"
+BASELINE_CURVE_NAME = "gurobi_r2_base_curve.csv"
+BASELINE_RESULTS_NAME = "gurobi_r2_base_results.xlsx"
 SENSITIVITY_ENVELOPE_NAME = "fleet_joint_macc_sensitivity_envelope.png"
 SCENARIO_SORTED_DIR = "fleet_joint_scenario_sorted_macc"
+R2_SET = os.environ.get("R2_SET", "ec10")  # result set: ec10 (10% EC baseline) or ec20 (20% EC baseline)
+R2_EC_LEVEL = "20%" if R2_SET == "ec20" else "10%"  # ec10 and ec10_avoided: 10% baseline
 
 COMPOSITE_1_OUT = "paper_composite_1_sensitivity_nodes.png"
 COMPOSITE_2_OUT = "paper_composite_2_uncertainty_abc.png"
@@ -28,6 +32,11 @@ TECH_SPLIT_COLORS = {
     "GB": "#00A087",
     "CC": "#E64B35",
 }
+
+
+def _node_label(abatement_t: float) -> str:
+    # Node label P_k: k is the abatement of the node in units of 0.1 Gt CO2, rounded to the nearest integer.
+    return f"P{int(round(abatement_t / 1e8))}"
 
 
 def _display_state_label(s: str) -> str:
@@ -71,7 +80,7 @@ def _load_state_share_series(result_xlsx: str) -> pd.DataFrame:
 
     rows = []
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
         need = ["x_ec", "x_cc", "blend_ratio", "target_abatement"]
         if any(c not in pdf.columns for c in need) or pdf.empty:
             continue
@@ -110,8 +119,8 @@ def _load_tech_share_split_series(
 
     rows = []
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
-        need = ["target_id", "target_abatement", "ec_abatement_ton", "bc_abatement_ton", "cc_capture_ton", "blend_ratio"]
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
+        need = ["target_id", "target_abatement", "ec_abatement_ton", "bc_net_abatement_ton", "cc_net_abatement_ton", "blend_ratio"]
         if any(c not in pdf.columns for c in need) or pdf.empty:
             continue
 
@@ -121,8 +130,8 @@ def _load_tech_share_split_series(
             continue
 
         ec = pd.to_numeric(pdf["ec_abatement_ton"], errors="coerce").fillna(0.0)
-        bc = pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0)
-        cc = pd.to_numeric(pdf["cc_capture_ton"], errors="coerce").fillna(0.0)
+        bc = pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0)
+        cc = pd.to_numeric(pdf["cc_net_abatement_ton"], errors="coerce").fillna(0.0)
         br = pd.to_numeric(pdf["blend_ratio"], errors="coerce").fillna(0.0)
 
         db_mask = (br > bc_threshold) & (br <= bc_split_ratio_threshold)
@@ -158,6 +167,8 @@ def _plot_tech_share_split_panel(ax: plt.Axes, data_dir: str, xlim: Tuple[float,
         return
 
     shares = _load_tech_share_split_series(result_xlsx)
+    # Drop the zero-abatement point (shares undefined there) so the areas start at the first target.
+    shares = shares[shares["target_abatement"] > 0].reset_index(drop=True)
     if shares.empty:
         ax.text(0.5, 0.5, "No technology share data", ha="center", va="center")
         return
@@ -252,15 +263,15 @@ def _compute_bc_share_for_target(result_xlsx: str, target_id: int) -> float:
 
     sheet = f"pm{target_id:02d}"
     try:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sheet)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sheet))
     except Exception:
         return np.nan
 
-    needed = {"bc_abatement_ton", "total_abatement_ton"}
+    needed = {"bc_net_abatement_ton", "total_abatement_ton"}
     if not needed.issubset(set(pdf.columns)) or pdf.empty:
         return np.nan
 
-    bc_total = pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0).sum()
+    bc_total = pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0).sum()
     ab_total = pd.to_numeric(pdf["total_abatement_ton"], errors="coerce").fillna(0.0).sum()
     if not np.isfinite(ab_total) or abs(ab_total) < 1e-12:
         return np.nan
@@ -273,7 +284,7 @@ def _compute_share_for_target(result_xlsx: str, target_id: int, numerator_col: s
 
     sheet = f"pm{target_id:02d}"
     try:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sheet)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sheet))
     except Exception:
         return np.nan
 
@@ -288,11 +299,23 @@ def _compute_share_for_target(result_xlsx: str, target_id: int, numerator_col: s
 
 
 def _load_plant_coordinates(data_dir: str) -> pd.DataFrame:
-    coord_path = os.path.join(data_dir, PLANT_COORD_XLSX_NAME)
-    if not os.path.exists(coord_path):
-        return pd.DataFrame(columns=["plant_id", "longitude", "latitude"])
-
-    pdf = pd.read_excel(coord_path)
+    # Coordinates: data/plant_coordinates.csv if present, else the longitude/latitude columns of the input
+    # workbook (data/ or ../other/).
+    pdf = pd.DataFrame()
+    csv_path = os.path.join(data_dir, "plant_coordinates.csv")  # optional: plant_i, longitude, latitude
+    if os.path.exists(csv_path):
+        pdf = pd.read_csv(csv_path)
+    for coord_path in [] if not pdf.empty else [
+        os.path.join(data_dir, PLANT_COORD_XLSX_NAME),
+        os.path.join(os.path.dirname(os.path.dirname(data_dir)), "other", PLANT_COORD_XLSX_NAME),
+    ]:
+        if not os.path.exists(coord_path):
+            continue
+        cand = pd.read_excel(coord_path, sheet_name="coal_plant_i")
+        lower = {str(c).strip().lower() for c in cand.columns}
+        if {"plant_i", "longitude", "latitude"}.issubset(lower) and cand.filter(regex="(?i)longitude").notna().any().any():
+            pdf = cand
+            break
     if pdf.empty:
         return pd.DataFrame(columns=["plant_id", "longitude", "latitude"])
 
@@ -300,8 +323,6 @@ def _load_plant_coordinates(data_dir: str) -> pd.DataFrame:
     pid_col = cols.get("plant_i")
     lon_col = cols.get("longitude")
     lat_col = cols.get("latitude")
-    if pid_col is None or lon_col is None or lat_col is None:
-        return pd.DataFrame(columns=["plant_id", "longitude", "latitude"])
 
     out = pd.DataFrame(
         {
@@ -322,7 +343,7 @@ def _load_node_spatial_states(result_xlsx: str, target_id: int, coords: pd.DataF
 
     sheet = f"pm{target_id:02d}"
     try:
-        sdf = pd.read_excel(result_xlsx, sheet_name=sheet)
+        sdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sheet))
     except Exception:
         return pd.DataFrame(columns=["plant_id", "longitude", "latitude", "state"])
 
@@ -469,9 +490,9 @@ def _build_scenario_sorted_points(plant_df: pd.DataFrame) -> pd.DataFrame:
         "plant_id",
         "ec_abatement_ton",
         "ec_cost",
-        "bc_abatement_ton",
+        "bc_net_abatement_ton",
         "bc_cost",
-        "cc_capture_ton",
+        "cc_net_abatement_ton",
         "cc_cost",
         "blend_ratio",
     ]
@@ -485,8 +506,8 @@ def _build_scenario_sorted_points(plant_df: pd.DataFrame) -> pd.DataFrame:
         blend_ratio = float(pd.to_numeric(r.get("blend_ratio", 0.0), errors="coerce") or 0.0)
         tech_map = [
             ("EC", pd.to_numeric(r.get("ec_abatement_ton"), errors="coerce"), pd.to_numeric(r.get("ec_cost"), errors="coerce")),
-            ("DB" if blend_ratio <= 0.2 else "GB", pd.to_numeric(r.get("bc_abatement_ton"), errors="coerce"), pd.to_numeric(r.get("bc_cost"), errors="coerce")),
-            ("CC", pd.to_numeric(r.get("cc_capture_ton"), errors="coerce"), pd.to_numeric(r.get("cc_cost"), errors="coerce")),
+            ("DB" if blend_ratio <= 0.2 else "GB", pd.to_numeric(r.get("bc_net_abatement_ton"), errors="coerce"), pd.to_numeric(r.get("bc_cost"), errors="coerce")),
+            ("CC", pd.to_numeric(r.get("cc_net_abatement_ton"), errors="coerce"), pd.to_numeric(r.get("cc_cost"), errors="coerce")),
         ]
         for tech, abate, cost in tech_map:
             if not np.isfinite(abate) or not np.isfinite(cost) or abate <= 0:
@@ -517,7 +538,7 @@ def _plot_sorted_unit_cost_panel(ax: plt.Axes, result_xlsx: str, target_id: int,
 
     sheet = f"pm{target_id:02d}"
     try:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sheet)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sheet))
     except Exception:
         ax.set_title(title, fontsize=12)
         ax.text(0.5, 0.5, f"Missing sheet {sheet}", ha="center", va="center", transform=ax.transAxes)
@@ -562,7 +583,8 @@ def _plot_sorted_unit_cost_panel(ax: plt.Axes, result_xlsx: str, target_id: int,
 
     ax.grid(alpha=0.2, linestyle="-")
     ax.axhline(0.0, color="black", linewidth=1.6, alpha=0.98, zorder=8)
-    ax.set_xlabel("Cumulative abatement (t CO$_2$)", fontsize=12)
+    ax.set_xlabel("Cumulative abatement (Gt CO$_2$)", fontsize=12)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x / 1e9:.1f}"))
     ax.set_ylabel("Unit abatement cost (USD t CO$_2^{-1}$)", fontsize=12)
     ax.tick_params(labelsize=9)
 
@@ -597,30 +619,25 @@ def _annotate_macc_point(
     )
 
 
-def _annotate_policy_thresholds(ax: plt.Axes, x_p12: float, x_p36: float, x_p47: float) -> None:
-    ax.vlines(x_p12, -29.0, -20.0, colors="red", linewidth=3, linestyles="-", zorder=12)
-    arrow_len = 0.34 * x_p12
-    x_left = x_p12 - arrow_len
+def _annotate_policy_thresholds(
+    ax: plt.Axes, x_zero: float, x_neutral: float, x_max: float, y_neutral: float, y_max: float
+) -> None:
+    # Positions follow the baseline curve (y values at the nodes) rather than fixed coordinates.
+    ax.vlines(x_zero, -29.0, -20.0, colors="red", linewidth=3, linestyles="-", zorder=12)
+    arrow_len = 0.34 * x_zero
+    x_left = x_zero - arrow_len
     ax.annotate(
         "",
         xy=(x_left, -24.5),
-        xytext=(x_p12, -24.5),
+        xytext=(x_zero, -24.5),
         arrowprops={"arrowstyle": "->", "color": "red", "linewidth": 1.0},
     )
-    ax.text(
-        x_left - 0.0 * arrow_len,
-        -40,
-        "Profitable Technology Retrofits",
-        ha="left",
-        va="bottom",
-        fontsize=9,
-        color="red",
-    )
+    ax.text(x_left, -40, "Profitable Technology Retrofits", ha="left", va="bottom", fontsize=9, color="red")
 
-    ax.vlines(x_p36, 60.0, 69.0, colors="red", linewidth=3, zorder=12)
-    ax.text(x_p36 - 0.1 * x_p36, 72.0, "Carbon-Neutrality Threshold", ha="left", va="bottom", fontsize=9, color="red")
-    ax.vlines(x_p47, 112.0, 121.0, colors="red", linewidth=3, zorder=12)
-    ax.text(x_p47 - 0.019 * x_p47, ax.get_ylim()[1] * 0.86, "Maximum Abatement Potential", ha="right", va="center", fontsize=9, color="red")
+    ax.vlines(x_neutral, y_neutral + 4.0, y_neutral + 13.0, colors="red", linewidth=3, zorder=12)
+    ax.text(x_neutral - 0.1 * x_neutral, y_neutral + 16.0, "Carbon-Neutrality Threshold", ha="left", va="bottom", fontsize=9, color="red")
+    ax.vlines(x_max, y_max - 13.0, y_max - 4.0, colors="red", linewidth=3, zorder=12)
+    ax.text(x_max - 0.019 * x_max, y_max - 8.5, "Maximum Abatement Potential", ha="right", va="center", fontsize=9, color="red")
 
 
 def _ensure_node_images_exist(script_dir: str, data_dir: str, target_ids: List[int]) -> None:
@@ -652,7 +669,7 @@ def _ensure_node_images_exist(script_dir: str, data_dir: str, target_ids: List[i
 def _plot_top_sensitivity_with_markers(ax: plt.Axes, data_dir: str, node_map: Dict[int, float]) -> None:
     """Baseline MAC curve only — with carbon-price guide lines and policy annotations.
     (Sensitivity envelope curves have been moved to Figure 2, panel b.)"""
-    baseline_path = os.path.join(data_dir, "gurobi_original_curve.csv")
+    baseline_path = os.path.join(data_dir, "gurobi_r2_base_curve.csv")
 
     base_df = _load_curve(baseline_path)
     xb, yb = _curve_xy(base_df)
@@ -667,22 +684,15 @@ def _plot_top_sensitivity_with_markers(ax: plt.Axes, data_dir: str, node_map: Di
     x_left = 0.0  # fixed; aligned with build_composite_1 set_xlim(0, 4.8e9)
 
     def _x_at_base_level(y_level: float) -> float:
+        # Largest abatement whose marginal cost does not exceed the price (left end of the MAC step that
+        # first exceeds it); each MAC value applies to the whole step ending at its point.
         if x_base.size < 2:
             return np.nan
-        above = np.where(y_base >= y_level)[0]
+        above = np.where(y_base > y_level)[0]
         if above.size == 0:
-            return np.nan
+            return float(x_base[-1])
         i_hi = int(above[0])
-        if i_hi == 0:
-            return float(x_base[0])
-        i_lo = i_hi - 1
-        x_lo, x_hi = float(x_base[i_lo]), float(x_base[i_hi])
-        y_lo, y_hi = float(y_base[i_lo]), float(y_base[i_hi])
-        if not np.isfinite(y_lo) or not np.isfinite(y_hi) or abs(y_hi - y_lo) < 1e-12:
-            return x_hi
-        frac = (y_level - y_lo) / (y_hi - y_lo)
-        frac = min(max(frac, 0.0), 1.0)
-        return x_lo + frac * (x_hi - x_lo)
+        return float(x_base[i_hi - 1]) if i_hi > 0 else 0.0
 
     guide_specs = [
         (9.0, "Carbon price = 9 (2025 average in China ETS)"),
@@ -705,13 +715,12 @@ def _plot_top_sensitivity_with_markers(ax: plt.Axes, data_dir: str, node_map: Di
             zorder=7,
         )
 
-    x_scale = 1e9 if np.nanmax(grid) > 1e6 else 1.0
-    p12_base_x = 1.17 * x_scale
-    p12_x = p12_base_x - 0.03 * x_scale
+    # Representative nodes (P_k: abatement of about k x 0.1 Gt CO2): the zero-marginal-cost node,
+    # the carbon-neutrality node and the maximum-abatement node.
+    node_ids = sorted(node_map)[:3]
     marker_specs = [
-        ("p12", p12_x, "black"),
-        ("p36", float(node_map.get(37, 3.6 * x_scale)), "#1F77B4"),
-        ("p47", float(node_map.get(48, node_map.get(47, 0.0))), "#D62728"),
+        (_node_label(node_map[tid]), float(node_map.get(tid, np.nan)), color)
+        for tid, color in zip(node_ids, ["black", "#1F77B4", "#D62728"])
     ]
     for label, x0, color in marker_specs:
         if not np.isfinite(x0) or x0 <= 0:
@@ -719,21 +728,23 @@ def _plot_top_sensitivity_with_markers(ax: plt.Axes, data_dir: str, node_map: Di
         y0 = float(np.interp(x0, xb, yb)) if xb.size >= 2 else np.nan
         if not np.isfinite(y0):
             continue
-        if label == "p12":
+        if label == marker_specs[0][0]:
             text_offset = (-6, -16)
-        elif label == "p47":
+        elif label == marker_specs[2][0]:
             text_offset = (0, 14)  # directly above the marker
         else:
             text_offset = (8, -12)
         _annotate_macc_point(ax, x0, y0, label, color, text_offset=text_offset)
 
-    x_p12 = marker_specs[0][1]
-    x_p36 = marker_specs[1][1]
-    x_p47 = marker_specs[2][1]
-    if all(np.isfinite(v) and v > 0 for v in [x_p12, x_p36, x_p47]):
-        _annotate_policy_thresholds(ax, x_p12, x_p36, x_p47)
+    x_zero = marker_specs[0][1]
+    x_neutral = marker_specs[1][1]
+    x_max = marker_specs[2][1]
+    if all(np.isfinite(v) and v > 0 for v in [x_zero, x_neutral, x_max]):
+        _annotate_policy_thresholds(
+            ax, x_zero, x_neutral, x_max, float(np.interp(x_neutral, xb, yb)), float(np.interp(x_max, xb, yb))
+        )
 
-    ax.set_title("(a) Maginal abatement cost curve under sensitivity analysis", fontsize=13)
+    ax.set_title("(a) Fleet-wide marginal abatement cost curve", fontsize=13)
     ax.set_xlabel("Target abatement (Gt CO$_2$)", fontsize=12)
     ax.set_ylabel("Marginal abatement cost (USD t CO$_2^{-1}$)", fontsize=12)
     ax.set_xlim(0.0, 4.8e9)
@@ -777,7 +788,7 @@ def _increase_figure_fontsizes(fig: plt.Figure, delta: float = 4.0) -> None:
 
 def build_composite_1(script_dir: str, data_dir: str, target_ids: List[int], out_path: str) -> str:
     baseline_df = _load_curve(os.path.join(data_dir, BASELINE_CURVE_NAME))
-    node_map = _target_id_to_abatement(baseline_df, sorted(set(target_ids + [36, 47])))
+    node_map = _target_id_to_abatement(baseline_df, sorted(set(target_ids)))
     result_xlsx = os.path.join(data_dir, BASELINE_RESULTS_NAME)
     coords = _load_plant_coordinates(data_dir)
 
@@ -851,60 +862,18 @@ def build_composite_1(script_dir: str, data_dir: str, target_ids: List[int], out
     )
     ax_top.set_xticks([0, 1e9, 2e9, 3e9, 4e9])
 
-    # ── Dual y-axis: average carbon intensity of electricity (tCO2/MWh) ──
-    # Load baseline total CO2 emissions from the curve / result
-    # Total annual generation (coal fleet) is constant — unaffected by retrofit type.
-    plants_raw = pd.read_excel(rrh_path, sheet_name="coal_plant_i")
-    pcols = list(plants_raw.columns)
-    def _pick_col(candidates):
-        for c in pcols:
-            if str(c).strip().lower() in candidates:
-                return c
-        return ""
-    em_col  = _pick_col(["carbon_emissions_ton", "co2", "carbon_emissions"])
-    pw_col  = _pick_col(["power", "capacity_xi", "capacity", "power_xi"])
-    rh_col  = _pick_col(["running_hours", "hours", "runninghours"])
-
-    total_base_emission = float(pd.to_numeric(plants_raw[em_col], errors="coerce").sum())
-    total_gen_kwh = (
-        pd.to_numeric(plants_raw[pw_col], errors="coerce").fillna(0.0)
-        * pd.to_numeric(plants_raw[rh_col], errors="coerce").fillna(0.0)
-        * 1000.0
-    ).sum()
-
-    baseline_path = os.path.join(data_dir, BASELINE_CURVE_NAME)
-    base_df = _load_curve(baseline_path)
-    x_abate = base_df["achieved_abatement"].to_numpy(dtype=float)
-    # Residual emissions = baseline - achieved_abatement
-    resid_emission = total_base_emission - x_abate
-    # Carbon intensity: tCO2 / (kWh / 1e6) = tCO2/MWh
-    carbon_intensity = resid_emission / (total_gen_kwh / 1e6)
-
-    ax_top2 = ax_top.twinx()
-    ax_top2.plot(
-        x_abate, carbon_intensity,
-        color="#D61AE4", linewidth=2.0, linestyle="-", alpha=0.85,
-        zorder=5,
-    )
-    ax_top2.set_ylabel("Avg carbon intensity (tCO$_2$/MWh)", fontsize=11, color="#D61AE4")
-    ax_top2.tick_params(axis="y", labelcolor="#D61AE4")
-    ax_top2.set_ylim(-300, carbon_intensity[0] * 1.12)
-    # Align right spine with plot boundary
-    ax_top2.spines["right"].set_position(("outward", 0))
-    ax_top.spines["right"].set_visible(False)
-
     xlim_top = ax_top.get_xlim()
 
     ax_mid = fig.add_subplot(gs[1, :], sharex=ax_top)
     _plot_tech_share_split_panel(ax_mid, data_dir, xlim_top)
     ax_mid.set_xlabel("Target abatement (Gt CO$_2$)", fontsize=12)
 
-    panel_label_map = {12: 12, 37: 36, 48: 47}
+    panel_label_map = {tid: _node_label(node_map[tid]) for tid in target_ids}  # target_id -> node label P_k
 
     for i, tid in enumerate(target_ids):
         ax = fig.add_subplot(gs[2, i])
         pdisp = panel_label_map.get(tid, tid)
-        _plot_sorted_unit_cost_panel(ax, result_xlsx, tid, f"(c{i+1}) Detailed portfolio in P{pdisp}")
+        _plot_sorted_unit_cost_panel(ax, result_xlsx, tid, f"(c{i+1}) Detailed portfolio in {pdisp}")
         if i > 0:
             ax.set_ylabel("")
 
@@ -914,10 +883,11 @@ def build_composite_1(script_dir: str, data_dir: str, target_ids: List[int], out
         "Target 2: \naiming to net-zero transition",
         "Target 3: \naiming for negative emissions",
     ]
+    # Regional patterns of the baseline nodes (regional technology shares at P8, P36 and P45)
     phase_descriptions = [
-        "Layout 1: \nNational EC adoption \n& Southeast DB pilot",
-        "Layout 2: \nGB expansion in \nCentral & North; \nCCS deployment in \nNorth & West",
-        "Layout 3: \nCCS rollout in South & East",
+        "Layout 1: \nNational EC adoption \n& DB outside North \n& Northwest",
+        "Layout 2: \nGB expansion in \nSouthwest, Northeast \n& South; \nCC deployment in \nNorthwest, Central \n& North",
+        "Layout 3: \nCC rollout in \nSouth & East",
     ]
     for i, tid in enumerate(target_ids):
         ax = fig.add_subplot(gs[3, i])
@@ -927,7 +897,7 @@ def build_composite_1(script_dir: str, data_dir: str, target_ids: List[int], out
         _plot_spatial_state_panel(
             ax,
             spatial_frames[i],
-            f"(d{i+1}) Fleet retrofit layout in P{pdisp}",
+            f"(d{i+1}) Fleet retrofit layout in {pdisp}",
             show_ylabel=(i == 0),
             highlight_color=highlight_color,
             previous_df=prev_df,
@@ -950,7 +920,7 @@ def build_composite_1(script_dir: str, data_dir: str, target_ids: List[int], out
     baseline_df = _load_curve(os.path.join(data_dir, BASELINE_CURVE_NAME))
     node_df = pd.DataFrame([
         {"target_id": tid, "target_abatement": node_map.get(tid, np.nan)}
-        for tid in sorted(target_ids + [35, 47])
+        for tid in sorted(set(target_ids))
     ])
     save_figure_bundle(
         fig,
@@ -972,8 +942,8 @@ def build_scenario_comparison(script_dir: str, data_dir: str, target_ids: List[i
     ax2 = ax.twinx()
 
     scenarios = [
-        ("Baseline", "gurobi_original_curve.csv", "#1F1F1F"),
-        ("No-EC", "gurobi_no_ec_curve.csv", "#1F77B4"),
+        ("Baseline", "gurobi_r2_base_curve.csv", "#1F1F1F"),
+        ("No-EC", "gurobi_r2_no_ec_curve.csv", "#1F77B4"),
         ("Standalone", "standalone_mac_curve.csv", "#D62728"),
     ]
 
@@ -1039,7 +1009,7 @@ def build_scenario_comparison(script_dir: str, data_dir: str, target_ids: List[i
     return out_path
 
 
-def _set_3col_legend(ax: plt.Axes, legend_specs: list) -> None:
+def _set_3col_legend(ax: plt.Axes, legend_specs: list, positions: list = None) -> None:
     """Draw three separate legends side-by-side to simulate a 3-column layout.
     
     legend_specs: list of tuples
@@ -1080,7 +1050,8 @@ def _set_3col_legend(ax: plt.Axes, legend_specs: list) -> None:
 
     # Use three separate legends with ncol=1 each, positioned side by side
     # bbox_to_anchor positions in axes fraction
-    positions = [(0.0, 0.8), (0.15, 0.72), (0.30, 0.72)]
+    if positions is None:
+        positions = [(0.0, 0.8), (0.15, 0.72), (0.30, 0.72)]
 
     for ci in range(min(ncols, len(positions))):
         if any(l.strip() != "" for l in col_labels[ci] if l != " "):
@@ -1098,19 +1069,6 @@ def _set_3col_legend(ax: plt.Axes, legend_specs: list) -> None:
                 borderaxespad=0.0,
                 
             )
-            print("Legend", ci)
-            for t in leg.get_texts():
-                print(
-                    t.get_text(),
-                    t.get_fontsize(),
-                    t.get_fontproperties().get_size_in_points() )
-            renderer = ax.figure.canvas.get_renderer()
-            bbox = leg.get_window_extent(renderer)
-            print(
-                f"Legend {ci}: width={bbox.width:.1f}, height={bbox.height:.1f}"
-            )
-            print(len(ax.artists))
-            print(ax.legend_)
             ax.add_artist(leg)
     ax.legend_ = None
 
@@ -1228,7 +1186,7 @@ def _plot_multi_curve_only(
                 if baseline_plotted:
                     continue  # skip duplicate baseline
                 baseline_plotted = True
-                label_str = "Baseline (100% biomass, 20% EC, 90% CC)"
+                label_str = f"Baseline (100% biomass, EC {R2_EC_LEVEL}, 90% CC)"
                 plot_color = "#1F1F1F"
                 lw = 3.2
                 ls = "-"
@@ -1380,8 +1338,10 @@ def _plot_mac_comparison_panel(ax: plt.Axes, data_dir: str) -> None:
 
     # Baseline and No-EC: loaded via _load_curve (joint-model format)
     for label, fname, color, ls, lw in [
-        ("Baseline (joint model)", "gurobi_original_curve.csv", "#1F1F1F", "-", 3.2),
-        ("No-EC (joint model)", "gurobi_no_ec_curve.csv", "#1F77B4", ":", 2.4),
+        ("Baseline (joint model)", "gurobi_r2_base_curve.csv", "#1F1F1F", "-", 3.2),
+        ("No EC interactions (joint model)", "gurobi_r2_no_ec_interaction_curve.csv", "#2CA02C", "--", 2.2),
+        ("No interactions (joint model)", "gurobi_r2_no_interaction_curve.csv", "#E67E22", "--", 2.4),
+        ("No-EC (joint model)", "gurobi_r2_no_ec_curve.csv", "#1F77B4", ":", 2.4),
     ]:
         path = os.path.join(data_dir, fname)
         if not os.path.exists(path):
@@ -1407,7 +1367,7 @@ def _plot_mac_comparison_panel(ax: plt.Axes, data_dir: str) -> None:
             x_plot = raw_x[mask] / 1e9
             y_plot = raw_y[mask]
             ax.plot(x_plot, y_plot, color="#D62728", linewidth=2.4,
-                    linestyle="--", alpha=0.92, label="Standalone (EC+BC+CC)", zorder=5)
+                    linestyle="-.", alpha=0.92, label="Standalone technology ranking", zorder=5)
             if len(x_plot) >= 2:
                 last_points.append((float(x_plot[-1]), float(y_plot[-1])))
         except Exception:
@@ -1416,11 +1376,11 @@ def _plot_mac_comparison_panel(ax: plt.Axes, data_dir: str) -> None:
     ax.axhline(0, color="black", linewidth=1.5, alpha=0.9, zorder=4)
     ax.set_xlabel("Abatement target (Gt CO₂)", fontsize=12)
     ax.set_ylabel("Marginal abatement cost (USD/tCO₂)", fontsize=12)
-    ax.set_title("(a) MAC curve comparison: baseline, standalone, and no-EC", fontsize=13)
+    ax.set_title("(a) MAC curves with and without technology interactions", fontsize=13)
     ax.grid(alpha=0.2, linestyle="--")
     ax.legend(frameon=False, fontsize=12, loc="upper left", bbox_to_anchor=(0, 0.85))
-    ax.set_xlim(0.0, 5.2)
-    ax.set_ylim(-60.0, 140.0)
+    ax.set_xlim(0.0, 5.5)
+    ax.set_ylim(-60.0, 180.0)
     # Droplines after xlim is set so they reach the actual axes
     for x_last, y_last in last_points:
         _add_droplines(ax, x_last, y_last, "#1F1F1F", lw=1.2)
@@ -1431,8 +1391,8 @@ def _plot_scenario_comparison_panel(
 ) -> None:
     """Panel (b): bar+line dual-axis – total cost and total abatement for three scenarios."""
     scenarios = [
-        ("Baseline", "gurobi_original_curve.csv", "#1F1F1F"),
-        ("No-EC", "gurobi_no_ec_curve.csv", "#1F77B4"),
+        ("Baseline", "gurobi_r2_base_curve.csv", "#1F1F1F"),
+        ("No-EC", "gurobi_r2_no_ec_curve.csv", "#1F77B4"),
         ("Standalone", "standalone_mac_curve.csv", "#D62728"),
     ]
     x_selected = np.array([target_map[t] for t in target_ids if t in target_map], dtype=float)
@@ -1498,57 +1458,71 @@ def _plot_scenario_comparison_panel(
 def build_composite_2(script_dir: str, data_dir: str, target_ids: List[int], out_path: str) -> str:
     baseline_curve = _load_curve(os.path.join(data_dir, BASELINE_CURVE_NAME))
     target_map = _target_id_to_abatement(baseline_curve, target_ids)
-    fig, axes = plt.subplots(3, 1, figsize=(14.8, 14.0), sharex=False)
+    fig, axes = plt.subplots(4, 1, figsize=(14.8, 18.6), sharex=False)
 
     # --- Sensitivity specs for panel (b) ---
     sensitivity_specs = [
         {
             "label": "Baseline",
-            "curve_path": os.path.join(data_dir, "gurobi_original_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_original_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_base_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_base_results.xlsx"),
             "color": "#0B1F3A",
             "linestyle": "-",
             "is_baseline": True,
         },
         {
-            "label": "CAPEX -30%",
-            "curve_path": os.path.join(data_dir, "gurobi_capex_0p70_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_capex_0p70_results.xlsx"),
+            "label": "CC CAPEX -30%",
+            "curve_path": os.path.join(data_dir, "gurobi_r2_capex_0p70_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_capex_0p70_results.xlsx"),
             "color": "#0DBFEC",
             "linestyle": "-",
         },
         {
-            "label": "CAPEX +30%",
-            "curve_path": os.path.join(data_dir, "gurobi_capex_1p30_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_capex_1p30_results.xlsx"),
+            "label": "CC CAPEX +30%",
+            "curve_path": os.path.join(data_dir, "gurobi_r2_capex_1p30_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_capex_1p30_results.xlsx"),
             "color": "#0DBFEC",
             "linestyle": "-.",
         },
         {
+            "label": "BC CAPEX -30%",
+            "curve_path": os.path.join(data_dir, "gurobi_r2_bc_capex_0p70_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_bc_capex_0p70_results.xlsx"),
+            "color": "#8E44AD",
+            "linestyle": "-",
+        },
+        {
+            "label": "BC CAPEX +30%",
+            "curve_path": os.path.join(data_dir, "gurobi_r2_bc_capex_1p30_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_bc_capex_1p30_results.xlsx"),
+            "color": "#8E44AD",
+            "linestyle": "-.",
+        },
+        {
             "label": "Coal -25%",
-            "curve_path": os.path.join(data_dir, "gurobi_coal_m25_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_coal_m25_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_coal_m25_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_coal_m25_results.xlsx"),
             "color": "#C0392B",
             "linestyle": "-",
         },
         {
             "label": "Coal +25%",
-            "curve_path": os.path.join(data_dir, "gurobi_coal_p25_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_coal_p25_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_coal_p25_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_coal_p25_results.xlsx"),
             "color": "#C0392B",
             "linestyle": "-.",
         },
         {
             "label": "Discount AF 5%",
-            "curve_path": os.path.join(data_dir, "gurobi_af5_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_af5_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_af5_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_af5_results.xlsx"),
             "color": "#1E8449",
             "linestyle": "-",
         },
         {
             "label": "Discount AF 12%",
-            "curve_path": os.path.join(data_dir, "gurobi_af12_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_af12_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_af12_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_af12_results.xlsx"),
             "color": "#1E8449",
             "linestyle": "-.",
         },
@@ -1556,97 +1530,112 @@ def build_composite_2(script_dir: str, data_dir: str, target_ids: List[int], out
     biomass_specs = [
         {
             "label": "Baseline (100%)",
-            "curve_path": os.path.join(data_dir, "gurobi_original_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_original_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_base_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_base_results.xlsx"),
             "color": "#1F1F1F",
             "linestyle": "-",
             "is_baseline": True,
-            "share_col": "bc_abatement_ton_model",
+            "share_col": "bc_net_abatement_ton",
         },
         {
             "label": "Supply 75%",
-            "curve_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_75_curve.csv"),
-            "results_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_75_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_bio_supply_75_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_bio_supply_75_results.xlsx"),
             "color": "#006D2C",
             "linestyle": "-",
-            "share_col": "bc_abatement_ton_model",
+            "share_col": "bc_net_abatement_ton",
         },
         {
             "label": "Supply 50%",
-            "curve_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_50_curve.csv"),
-            "results_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_50_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_bio_supply_50_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_bio_supply_50_results.xlsx"),
             "color": "#31A354",
             "linestyle": "-.",
-            "share_col": "bc_abatement_ton_model",
+            "share_col": "bc_net_abatement_ton",
         },
         {
             "label": "Supply 25%",
-            "curve_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_25_curve.csv"),
-            "results_path": os.path.join(data_dir, "biomass_supply_sensitivity_bio_supply_25_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_bio_supply_25_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_bio_supply_25_results.xlsx"),
             "color": "#78C679",
             "linestyle": ":",
-            "share_col": "bc_abatement_ton_model",
+            "share_col": "bc_net_abatement_ton",
         },
     ]
 
+    # EC sensitivity curves depend on the result set (R2_SET = ec10 or ec20 baseline).
+    if R2_SET == "ec20":
+        ec_base_label = "Baseline (EC 20%)"
+        ec_list = [
+            ("EC 17.5%", "ec_r175_o00", "#FDAE6B", "-."),
+            ("EC 15%", "ec_r15_o00", "#FDD0A2", ":"),
+            ("EC 15%, overlap 25%", "ec_r15_o25", "#7F2704", "--"),
+            ("EC 15%, overlap 50%", "ec_r15_o50", "#A63603", ":"),
+            ("EC 10%, without technology No. 5", "ec_no5_r10", "#2C7FB8", "-"),
+            ("EC 10%, with technology No. 5", "ec_r10_with5", "#6A51A3", "--"),
+        ]
+    else:
+        ec_base_label = "Baseline (EC 10%, without No. 5)"
+        ec_list = [
+            ("EC 20%", "ec_r20_o00", "#8C2D04", "-"),
+            ("EC 17.5%", "ec_r175_o00", "#FDAE6B", "-."),
+            ("EC 15%", "ec_r15_o00", "#FDD0A2", ":"),
+            ("EC 15%, overlap 25%", "ec_r15_o25", "#7F2704", "--"),
+            ("EC 15%, overlap 50%", "ec_r15_o50", "#A63603", ":"),
+            ("EC 10%, with technology No. 5", "ec_r10_with5", "#6A51A3", "-"),
+        ]
     ecsave_specs = [
         {
-            "label": "Baseline (EC 20%)",
-            "curve_path": os.path.join(data_dir, "gurobi_original_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_original_results.xlsx"),
+            "label": ec_base_label,
+            "curve_path": os.path.join(data_dir, "gurobi_r2_base_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_base_results.xlsx"),
             "color": "#D94801",
             "linestyle": "-",
             "is_baseline": True,
             "share_col": "ec_abatement_ton",
-        },
+        }
+    ] + [
         {
-            "label": "EC 17.5%",
-            "curve_path": os.path.join(data_dir, "gurobi_ecsave_17p5_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_ecsave_17p5_results.xlsx"),
-            "color": "#FDAE6B",
-            "linestyle": "-.",
+            "label": label,
+            "curve_path": os.path.join(data_dir, f"gurobi_r2_{name}_curve.csv"),
+            "results_path": os.path.join(data_dir, f"gurobi_r2_{name}_results.xlsx"),
+            "color": color,
+            "linestyle": ls,
             "share_col": "ec_abatement_ton",
-        },
-        {
-            "label": "EC 15%",
-            "curve_path": os.path.join(data_dir, "gurobi_ecsave_15_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_ecsave_15_results.xlsx"),
-            "color": "#FDD0A2",
-            "linestyle": ":",
-            "share_col": "ec_abatement_ton",
-        },
+        }
+        for label, name, color, ls in ec_list
     ]
 
     ccrate_specs = [
         {
             "label": "Baseline (90%)",
-            "curve_path": os.path.join(data_dir, "gurobi_original_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_original_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_base_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_base_results.xlsx"),
             "color": "#54278F",
             "linestyle": "-",
             "is_baseline": True,
-            "share_col": "cc_capture_ton",
+            "share_col": "cc_net_abatement_ton",
         },
         {
             "label": "Capture 95%",
-            "curve_path": os.path.join(data_dir, "gurobi_cc_rate_95_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_cc_rate_95_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_cc_rate_95_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_cc_rate_95_results.xlsx"),
             "color": "#9E9AC8",
             "linestyle": "-.",
-            "share_col": "cc_capture_ton",
+            "share_col": "cc_net_abatement_ton",
         },
         {
             "label": "Capture 99.7%",
-            "curve_path": os.path.join(data_dir, "gurobi_cc_rate_99p7_curve.csv"),
-            "results_path": os.path.join(data_dir, "gurobi_cc_rate_99p7_results.xlsx"),
+            "curve_path": os.path.join(data_dir, "gurobi_r2_cc_rate_99p7_curve.csv"),
+            "results_path": os.path.join(data_dir, "gurobi_r2_cc_rate_99p7_results.xlsx"),
             "color": "#CBC9E2",
             "linestyle": ":",
-            "share_col": "cc_capture_ton",
+            "share_col": "cc_net_abatement_ton",
         },
     ]
 
     common_xlim = (0.0, 5.2e9)
-    common_ylim = (-60.0, 140.0)
+    common_ylim = (-60.0, 180.0)
 
     _plot_mac_comparison_panel(axes[0], data_dir)
 
@@ -1656,37 +1645,53 @@ def build_composite_2(script_dir: str, data_dir: str, target_ids: List[int], out
         sensitivity_specs,
         target_ids,
         target_map,
-        "(b)  Parametric sensitivity of fleet MAC: coal price, CAPEX, and discount rate",
+        "(b)  Parametric sensitivity of fleet MAC: coal price, CC and BC CAPEX, and discount rate",
         common_xlim,
         common_ylim,
     )
     _set_3col_legend(axes[1], [
         ("Baseline", "#1F1F1F", "-"),
-        (["CAPEX -30%", "CAPEX +30%"], "#0DBFEC", ["-", "-."]),
+        (["CC CAPEX -30%", "CC CAPEX +30%"], "#0DBFEC", ["-", "-."]),
+        (["BC CAPEX -30%", "BC CAPEX +30%"], "#8E44AD", ["-", "-."]),
         (["Coal -25%", "Coal +25%"], "#C0392B", ["-", "-."]),
         (["Discount rate 5%", "Discount rate 12%"], "#1E8449", ["-", "-."]),
-    ])
+    ], positions=[(0.0, 0.8), (0.19, 0.72), (0.37, 0.72), (0.51, 0.72)])
 
-    # Panel (c): combined uncertainty — biomass supply, EC saving rate, CC capture rate
+    # Panel (c): resources and engineering — biomass supply and CC capture rate
     _plot_multi_curve_only(
         axes[2],
         [
             ("Biomass supply", biomass_specs, 0),
-            ("EC saving rate", ecsave_specs, 1),
             ("CC capture rate", ccrate_specs, 2),
         ],
         target_ids,
         target_map,
-        "(c)  Multi-dimensional uncertainty: biomass supply, EC saving rate, and CC capture rate",
+        "(c)  Resource and engineering uncertainty: biomass supply and CC capture rate",
         common_xlim,
         common_ylim,
     )
     _set_3col_legend(axes[2], [
-        ("Baseline (100% biomass, 20% EC, 90% Capture)", "#1F1F1F", "-"),
+        (f"Baseline (100% biomass, EC {R2_EC_LEVEL}, 90% capture)", "#1F1F1F", "-"),
         (["Supply 75%", "Supply 50%", "Supply 25%"], "#006D2C", ["-", "-.", ":"]),
-        (["EC 17.5%", "EC 15%"], "#D94801", ["-.", ":"]),
         (["Capture 95%", "Capture 99.7%"], "#54278F", ["-.", ":"]),
     ])
+
+    # Panel (d): energy-conservation assumptions — saving level, overlap, technology No. 5
+    _plot_multi_curve_only(
+        axes[3],
+        [("EC assumptions", ecsave_specs, 1)],
+        target_ids,
+        target_map,
+        "(d)  Energy-conservation assumptions: saving level, overlap among measures, and technology No. 5",
+        common_xlim,
+        common_ylim,
+    )
+    _set_3col_legend(axes[3], [
+        (ec_base_label, "#1F1F1F", "-"),
+        ([l for l, n, _, _ in ec_list if "overlap" not in l and "No. 5" not in l], "#D94801", ["-", "-.", ":"]),
+        (["EC 15%, overlap 25%", "EC 15%, overlap 50%"], "#A63603", ["--", ":"]),
+        ([l.replace("technology ", "") for l, n, _, _ in ec_list if "No. 5" in l], "#6A51A3", ["-", "--"]),
+    ], positions=[(0.0, 0.8), (0.15, 0.72), (0.38, 0.72)])
 
     axes[-1].set_xlabel("Abatement target (Gt CO$_2$)", fontsize=12)
 
@@ -1712,7 +1717,8 @@ def build_composite_2(script_dir: str, data_dir: str, target_ids: List[int], out
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build paper-ready composite figures for sensitivity and uncertainty MAC analysis.")
-    parser.add_argument("--target-ids", nargs="+", type=int, default=[12, 36, 48], help="Selected target IDs, e.g., 12 36 48")
+    parser.add_argument("--target-ids", nargs="+", type=int, default=None,
+                        help="Target IDs of the three nodes; default: node with marginal cost closest to zero, first carbon-neutral target, maximum target")
     parser.add_argument("--out1", default=None, help="Output path for composite figure 1")
     parser.add_argument("--out2", default=None, help="Output path for composite figure 2")
     args = parser.parse_args()
@@ -1720,6 +1726,14 @@ def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, DATA_DIR_NAME)
 
+    if args.target_ids is None:
+        c = pd.read_csv(os.path.join(data_dir, BASELINE_CURVE_NAME))
+        # carbon-neutrality node: first target whose abatement reaches the fleet's baseline emissions
+        e0 = float(pd.read_excel(os.path.join(data_dir, "1885_coal_power_plants_original.xlsx"), sheet_name="coal_plant_i")["carbon_emissions_ton"].sum())
+        neutral = c.loc[c["achieved_abatement"] >= e0 * (1 - 1e-9), "target_id"]
+        # zero-marginal-cost node: the target whose marginal abatement cost is closest to zero
+        mac0 = int(c.loc[pd.to_numeric(c["marginal_cost_diff"], errors="coerce").abs().idxmin(), "target_id"])
+        args.target_ids = [mac0, int(neutral.min()), int(c["target_id"].max())]
     out1 = args.out1 or os.path.join(data_dir, COMPOSITE_1_OUT)
     out2 = args.out2 or os.path.join(data_dir, COMPOSITE_2_OUT)
     out3 = os.path.join(data_dir, "fig_scenario_comparison.png")

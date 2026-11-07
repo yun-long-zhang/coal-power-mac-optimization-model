@@ -27,9 +27,11 @@ pl = pd.read_csv(os.path.join(DATA, "uac_interaction_decomp_plant_level.csv"))
 
 # ── target-summary derived quantities ────────────────────────────────────────
 ts["target_Gt"] = ts["target_abatement"] / 1e9
-ts["avg_delta_uac"] = ts["sum_delta_uac"] / ts["n_plants"]
-ts["avg_cost"] = ts["sum_cost_component"] / ts["n_plants"]
-ts["avg_abate"] = ts["sum_abatement_component"] / ts["n_plants"]
+# Average over plants where EC actually affects the downstream technology.
+_n = ts["n_affected"].where(ts["n_affected"] > 0) if "n_affected" in ts else ts["n_plants"]
+ts["avg_delta_uac"] = ts["sum_delta_uac"] / _n
+ts["avg_cost"] = ts["sum_cost_component"] / _n
+ts["avg_abate"] = ts["sum_abatement_component"] / _n
 
 bc_ts = ts[ts["tech"] == "BC"].sort_values("target_Gt").reset_index(drop=True)
 cc_ts = ts[ts["tech"] == "CC"].sort_values("target_Gt").reset_index(drop=True)
@@ -81,6 +83,14 @@ def _stacked_area_panel(ax, data, title, ylabel):
 # Helper – hexbin density panel  (from original plot_decomposition_bc_cc_combined.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _hexbin_panel(ax, df, cmap, title, show_ylabel, fig_ref):
+    if df.empty:
+        # No plant with a non-zero change (e.g. BC: all cost and abatement terms scale with biomass input,
+        # so the UAC of co-firing is unchanged by prior EC).
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.text(0.5, 0.5, "$\\Delta UAC_{BC} = 0$ at every plant:\nall BC cost terms and BC abatement\nscale with the EC-reduced biomass input",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        return
     xcol = "delta_uac_cost_numerator"
     ycol = "delta_uac_abatement_denominator"
     x = df[xcol].values

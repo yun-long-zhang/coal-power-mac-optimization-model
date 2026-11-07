@@ -27,8 +27,8 @@ ABATEMENT_CONSTRAINT_MODE = "per_plant_tight"  # fleet_tight (default), per_plan
 OVER_TARGET_TOL_RATIO = 0.0001  # allow at most 1% overshoot around target by default
 MIN_OVERSHOOT_PENALTY = 1000.0  # CNY per ton overshoot; encourages solutions close to target
 OVERSHOOT_RELAX_PENALTY = 1e7  # large penalty for violating overshoot cap when unavoidable
-EC_UNIT_COLS_SPEC = "O:AH"  # Default fixed unit-cost columns provided by user.
-EC_ABATE_COLS_SPEC = "AK:BD"  # Default fixed abatement columns provided by user.
+EC_UNIT_COLS_SPEC = ""  # optional fixed unit-cost columns, e.g. "O:AH"; empty: detect tech_1 ... tech_20 by name
+EC_ABATE_COLS_SPEC = ""  # optional fixed abatement columns, e.g. "AK:BD"; empty: detect tech_1.1 ... tech_20.1 by name
 EC_UNIT_REV_COL_SPEC = ""  # optional single column, e.g. "AV" or "48"
 
 # Process-based classification for 20 EC technologies.
@@ -207,14 +207,31 @@ def _parse_tech_num_from_id(tech_id: str) -> int:
         return -1
 
 
-def _pair_overlap_coef(tech_id_1: str, tech_id_2: str, overlap_coef: float) -> float:
-    n1 = _parse_tech_num_from_id(tech_id_1)
-    n2 = _parse_tech_num_from_id(tech_id_2)
-    c1 = TECH_CATEGORY_BY_NUM.get(n1, DEFAULT_TECH_CATEGORY)
-    c2 = TECH_CATEGORY_BY_NUM.get(n2, DEFAULT_TECH_CATEGORY)
-    if c1 == c2:
-        return float(overlap_coef)
-    return 0.0
+def _tech_category(tech_id: str) -> str:
+    return TECH_CATEGORY_BY_NUM.get(_parse_tech_num_from_id(tech_id), DEFAULT_TECH_CATEGORY)
+
+
+def _category_counts(tech_ids: List[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for t in tech_ids:
+        c = _tech_category(t)
+        counts[c] = counts.get(c, 0) + 1
+    return counts
+
+
+def _pair_overlap_coef(tech_id_1: str, tech_id_2: str, overlap_coef: float, category_counts: Dict[str, int]) -> float:
+    # Same-category pairs share delta / (n_c - 1), where n_c is the number of candidate
+    # sub-technologies of that category at the plant. Each added measure k then loses at most
+    # delta * a_k, so its net contribution stays >= (1 - delta) * a_k and abatement is
+    # monotone in the selected set.
+    c1 = _tech_category(tech_id_1)
+    c2 = _tech_category(tech_id_2)
+    if c1 != c2:
+        return 0.0
+    n_c = int(category_counts.get(c1, 0))
+    if n_c < 2:
+        return 0.0
+    return float(overlap_coef) / float(n_c - 1)
 
 
 def load_ec_subtech_inputs(
@@ -334,6 +351,7 @@ def build_problem(
     over_target_tol_ratio: float,
     min_overshoot_penalty: float,
     overshoot_relax_penalty: float,
+    plant_ratio: Dict[str, float] = None,
 ) -> Tuple[LpProblem, Dict[Tuple[str, str], LpVariable], object, object]:
     model = LpProblem("EC_Subtech_Binary_MinCost", LpMinimize)
 
@@ -373,15 +391,16 @@ def build_problem(
             cost_expr_terms.append(c * var)
 
         # Overlap penalty for jointly selected EC technologies at the same plant.
-        # Penalty_{t,u} = overlap_coef_same_category * min(a_t, a_u) * y_{t,u}, where y_{t,u}=x_t*x_u.
+        # Penalty_{t,u} = overlap_coef / (n_c - 1) * min(a_t, a_u) * y_{t,u}, where y_{t,u}=x_t*x_u.
         # Cross-category pairs are treated as no-overlap (coefficient 0).
         overlap_penalty_terms = []
+        cat_counts = _category_counts([t for t, _u, _a, _c in candidates])
         if float(overlap_coef) > 0:
             for i in range(len(candidates)):
                 t1, _u1, a1, _c1 = candidates[i]
                 for j in range(i + 1, len(candidates)):
                     t2, _u2, a2, _c2 = candidates[j]
-                    pair_coef = _pair_overlap_coef(t1, t2, overlap_coef)
+                    pair_coef = _pair_overlap_coef(t1, t2, overlap_coef, cat_counts)
                     if pair_coef <= 0:
                         continue
                     penalty_base = min(float(a1), float(a2))
@@ -397,7 +416,8 @@ def build_problem(
 
         if constraint_mode in {"per_plant", "per_plant_tight"}:
             # Per-plant abatement requirement.
-            required_abatement = float(plant_emission.get(p, 0.0)) * float(ratio)
+            p_ratio = float(plant_ratio.get(p, ratio)) if plant_ratio is not None else float(ratio)
+            required_abatement = float(plant_emission.get(p, 0.0)) * p_ratio
             if overlap_penalty_terms:
                 plant_abatement_expr = lpSum(a * x[(p, t)] for t, _u, a, _c in candidates) - lpSum(overlap_penalty_terms)
             else:
@@ -484,16 +504,30 @@ def solve_scenario(
     over_target_tol_ratio: float,
     min_overshoot_penalty: float,
     overshoot_relax_penalty: float,
+    plant_ratio_cap: Dict[str, float] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     total_baseline = float(plants["base_emission"].sum())
-    target = ratio * total_baseline
 
     plant_required = plants[["plant_id", "base_emission"]].copy()
-    plant_required["required_abatement_ton"] = plant_required["base_emission"] * float(ratio)
-
     per_plant_max = compute_per_plant_capability(ec_subtech)
     plant_required = plant_required.merge(per_plant_max, on="plant_id", how="left")
     plant_required["max_abatement_ton"] = pd.to_numeric(plant_required["max_abatement_ton"], errors="coerce").fillna(0.0)
+
+    # Plant-specific target ratio. With a cap file, each plant targets
+    # min(ratio, physical cap, technical max of the remaining EC measures).
+    plant_required["target_ratio"] = float(ratio)
+    if plant_ratio_cap is not None:
+        cap = plant_required["plant_id"].map(plant_ratio_cap).astype(float).fillna(float(ratio))
+        tech_max = np.where(
+            plant_required["base_emission"] > 0,
+            plant_required["max_abatement_ton"] / plant_required["base_emission"].replace(0, np.nan),
+            0.0,
+        )
+        tech_max = np.nan_to_num(tech_max, nan=0.0) * (1.0 - 1e-9)
+        plant_required["target_ratio"] = np.minimum(np.minimum(cap, float(ratio)), tech_max)
+    plant_required["required_abatement_ton"] = plant_required["base_emission"] * plant_required["target_ratio"]
+    plant_ratio = plant_required.set_index("plant_id")["target_ratio"].to_dict()
+    target = float(plant_required["required_abatement_ton"].sum())
     plant_required["is_plant_feasible"] = (
         plant_required["required_abatement_ton"] <= plant_required["max_abatement_ton"] + 1e-6
     )
@@ -544,6 +578,7 @@ def solve_scenario(
         over_target_tol_ratio=over_target_tol_ratio,
         min_overshoot_penalty=min_overshoot_penalty,
         overshoot_relax_penalty=overshoot_relax_penalty,
+        plant_ratio=plant_ratio,
     )
     status = _solve_model(model, use_gurobi, time_limit_sec, mip_gap, threads)
     summary["status"] = status
@@ -574,6 +609,7 @@ def solve_scenario(
         d = {
             "plant_id": p,
             "base_emission": float(row["base_emission"]),
+            "target_ratio": float(row["target_ratio"]),
             "required_abatement_ton": float(row["required_abatement_ton"]),
             "max_abatement_ton": float(row["max_abatement_ton"]),
             "is_plant_feasible": bool(row["is_plant_feasible"]),
@@ -596,11 +632,12 @@ def solve_scenario(
                 total_retrofit_cost_p += a * u
 
         if float(overlap_coef) > 0 and len(selected_techs) >= 2:
+            cat_counts = _category_counts([t for t in tech_ids if float(abate_lookup.get((p, t), 0.0)) > 0])
             for i in range(len(selected_techs)):
                 for j in range(i + 1, len(selected_techs)):
                     t1 = selected_techs[i]
                     t2 = selected_techs[j]
-                    pair_coef = _pair_overlap_coef(t1, t2, overlap_coef)
+                    pair_coef = _pair_overlap_coef(t1, t2, overlap_coef, cat_counts)
                     if pair_coef <= 0:
                         continue
                     a1 = float(abate_lookup.get((p, t1), 0.0))
@@ -751,6 +788,18 @@ def main() -> None:
         default=EC_UNIT_REV_COL_SPEC,
         help="Optional fixed EC unit coal-saving revenue column, e.g. 'AV' or '48'.",
     )
+    parser.add_argument(
+        "--exclude-techs",
+        type=int,
+        nargs="*",
+        default=[],
+        help="EC sub-technology numbers to exclude, e.g. 5",
+    )
+    parser.add_argument(
+        "--plant-ratio-cap-csv",
+        default=None,
+        help="Optional CSV with columns plant_id, ec_ratio_cap giving a plant-specific upper bound on the EC target ratio.",
+    )
     parser.add_argument("--output-prefix", default=OUTPUT_PREFIX, help="Output prefix in data folder.")
     args = parser.parse_args()
 
@@ -782,6 +831,13 @@ def main() -> None:
         abate_cols_spec=args.ec_abate_cols,
         unit_rev_col_spec=args.ec_unit_rev_col,
     )
+    if args.exclude_techs:
+        ec_subtech = ec_subtech[~ec_subtech["tech_num"].isin(set(args.exclude_techs))].copy()
+
+    plant_ratio_cap = None
+    if args.plant_ratio_cap_csv:
+        cap_df = pd.read_csv(args.plant_ratio_cap_csv)
+        plant_ratio_cap = dict(zip(cap_df["plant_id"].map(_norm_id), pd.to_numeric(cap_df["ec_ratio_cap"], errors="coerce")))
     use_gurobi = not args.no_gurobi
 
     summaries = []
@@ -806,6 +862,7 @@ def main() -> None:
                 over_target_tol_ratio=args.over_target_tol_ratio,
                 min_overshoot_penalty=args.min_overshoot_penalty,
                 overshoot_relax_penalty=args.overshoot_relax_penalty,
+                plant_ratio_cap=plant_ratio_cap,
             )
             summaries.append(summary)
 

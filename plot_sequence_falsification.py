@@ -47,7 +47,7 @@ POLICY_META = {
         "zorder": 10,
     },
     "ec_bc_cc": {
-        "label": "EC→BC→CC  (model ordering)",
+        "label": "EC→BC→CC",
         "color": "#27ae60",
         "lw": 1.8,
         "ls": "--",
@@ -81,7 +81,7 @@ POLICY_ORDER = ["unconstrained", "ec_bc_cc", "ec_cc_bc", "bc_cc", "cc_bc"]
 GAP_POLICIES  = ["ec_bc_cc", "ec_cc_bc", "bc_cc", "cc_bc"]   # Panel (b)
 
 # ── Shading thresholds ────────────────────────────────────────────────────────
-NET_ZERO_GT      = 3.6   # GtCO₂ — net-zero abatement target
+NET_ZERO_GT      = 3.56  # GtCO₂ — baseline fleet emissions (net-zero abatement)
 FLEET_MAX_GT     = 4.7   # GtCO₂ — full fleet maximum
 
 
@@ -110,7 +110,7 @@ def _make_figure(curves: pd.DataFrame, detail: pd.DataFrame):
     for policy in POLICY_ORDER:
         meta = POLICY_META[policy]
         sub  = curves[
-            (curves["policy"] == policy) & (curves["status"] == "Optimal")
+            (curves["policy"] == policy) & curves["status"].isin(["Optimal", "TimeLimit"]) & curves["total_cost"].notna()
         ].sort_values("achieved_abatement")
 
         ax_curve.plot(
@@ -127,7 +127,7 @@ def _make_figure(curves: pd.DataFrame, detail: pd.DataFrame):
     ax_curve.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.35)
     ax_curve.axvline(NET_ZERO_GT, color="#27ae60", linewidth=0.8, linestyle=":",
                      alpha=0.7, zorder=3)
-    ax_curve.text(NET_ZERO_GT + 0.04, ax_curve.get_ylim()[1] if False else 160,
+    ax_curve.text(NET_ZERO_GT + 0.04, ax_curve.get_ylim()[1] * 0.95,
                   f"Net-zero\n{NET_ZERO_GT} Gt", fontsize=7.5, color="#27ae60",
                   va="top", ha="left")
 
@@ -186,7 +186,7 @@ def _make_figure(curves: pd.DataFrame, detail: pd.DataFrame):
     # Net-zero reference
     ax_gap.axvline(NET_ZERO_GT, color="#27ae60", linewidth=0.8, linestyle=":",
                    alpha=0.7, zorder=3)
-    ax_gap.text(NET_ZERO_GT + 0.05, ax_gap.get_ylim()[1] if False else 57,
+    ax_gap.text(NET_ZERO_GT + 0.05, ax_gap.get_ylim()[1] * 0.95,
                 f"Net-zero\n{NET_ZERO_GT} Gt", fontsize=7.5, color="#27ae60",
                 va="top", ha="left")
 
@@ -199,18 +199,24 @@ def _make_figure(curves: pd.DataFrame, detail: pd.DataFrame):
         fontsize=10, fontweight="bold",
     )
 
-    # Annotate ec_bc_cc near-zero band
-    ax_gap.annotate(
-        "EC→BC→CC: max gap = $0.77 B USD\n(within MIP tolerance)",
-        xy=(1.5, 0.77), xycoords="data",
-        xytext=(1.0, 12),
-        fontsize=7.5, color="#27ae60",
-        arrowprops=dict(arrowstyle="->", color="#27ae60", lw=0.8),
-        ha="left",
-    )
+    # Annotate the EC->BC->CC gap from the data: near zero up to deep targets, then the largest gap.
+    seq = detail[(detail["policy"] == "ec_bc_cc") & detail["both_optimal"]].copy()
+    if not seq.empty:
+        k = seq["gap_abs_vs_ref"].idxmax()
+        x_max, g_max = float(seq.loc[k, "target_abatement"]) / 1e9, float(seq.loc[k, "gap_abs_vs_ref"]) / 1e9
+        near = seq[seq["gap_abs_vs_ref"].abs() <= 1e8]
+        x_near = float(near["target_abatement"].max()) / 1e9 if not near.empty else 0.0
+        ax_gap.annotate(
+            f"EC→BC→CC: gap < 0.1 B USD up to {x_near:.1f} Gt;\nmax {g_max:.1f} B USD at {x_max:.1f} Gt",
+            xy=(x_max, g_max), xycoords="data",
+            xytext=(1.0, 12),
+            fontsize=7.5, color="#27ae60",
+            arrowprops=dict(arrowstyle="->", color="#27ae60", lw=0.8),
+            ha="left",
+        )
 
     handles_b = (
-        [mpatches.Patch(color="#d5f5e3", alpha=0.8, label="±1 B USD band (MIP tolerance)")]
+        [mpatches.Patch(color="#d5f5e3", alpha=0.8, label="±1 B USD band")]
         + [
             Line2D([0], [0], color=POLICY_META[p]["color"],
                    linewidth=POLICY_META[p]["lw"],

@@ -6,12 +6,12 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-import optimization_fleet_joint_milp_persistent as base
+import optimization_1_fleet_joint_milp_persistent as base
 
 
 # ---- User config (edit before running) ----
 DATA_DIR_NAME = "data"
-INPUT_RESULTS_NAME = "gurobi_original_results.xlsx"
+INPUT_RESULTS_NAME = "gurobi_r2_base_results.xlsx"
 INPUT_WORKBOOK_NAME = "1885_coal_power_plants_original.xlsx"
 INPUT_BIOMASS_DISTANCE_NAME = "Dji_200.csv"
 INPUT_CO2_DISTANCE_NAME = "Dki_4000.csv"
@@ -93,23 +93,32 @@ def _compute_bc_counterfactual_rows(df: pd.DataFrame, plants_map: pd.DataFrame) 
         coal_price = float(pd.to_numeric(r.get("coal_price"), errors="coerce") or 0.0)
         energy = float(pd.to_numeric(r.get("energy_gj"), errors="coerce") or 0.0)
         feedstock = float(pd.to_numeric(r.get("bc_feedstock_cost"), errors="coerce") or 0.0)
+        bio_transport = float(pd.to_numeric(r.get("biomass_transport_cost"), errors="coerce") or 0.0)
 
-        # With prior EC: effective blend ratio shrinks by 20% when EC selected.
-        eff_with = blend * (1.0 - 0.2 * x_ec)
+        # With prior EC: effective blend ratio shrinks by the plant's EC saving ratio s_i.
+        s_ec = float(r["ec_saving_ratio"])
+        eff_with = blend * (1.0 - s_ec * x_ec)
         eff_noec = blend
+        # Biomass feedstock and transport scale with biomass use (θ_eff · E); same sources assumed without EC.
+        bio_scale = (eff_noec / eff_with) if eff_with > 1e-12 else 1.0
 
-        a_with = base_emission * eff_with
-        a_noec = base_emission * eff_noec
+        # net of the biomass supply-chain and haulage emissions (avoided accounting; zero otherwise),
+        # which scale with biomass use like feedstock and transport
+        logistics = float(pd.to_numeric(r.get("logistics_emission_ton"), errors="coerce") or 0.0)
+        a_with = base_emission * eff_with - logistics
+        a_noec = base_emission * eff_noec - logistics * bio_scale
 
+        af = float(r["bc_af"])
         c_with = (
-            1.02 * (1153000.0 * eff_with * power + 4628000.0 * high * power) * af / 6.8589
+            (1153000.0 * blend * power + 4628000.0 * high * power) * (af + base.BC_FIXED_OM_SHARE) / base.RMB_PER_USD
             - coal_price * energy * eff_with
             + feedstock
+            + bio_transport
         )
         c_noec = (
-            1.02 * (1153000.0 * eff_noec * power + 4628000.0 * high * power) * af / 6.8589
+            (1153000.0 * blend * power + 4628000.0 * high * power) * (af + base.BC_FIXED_OM_SHARE) / base.RMB_PER_USD
             - coal_price * energy * eff_noec
-            + feedstock
+            + (feedstock + bio_transport) * bio_scale
         )
 
         u_with = _safe_uac(c_with, a_with)
@@ -151,7 +160,6 @@ def _compute_cc_counterfactual_rows(df: pd.DataFrame, plants_map: pd.DataFrame, 
     cmap["plant_id"] = cmap["plant_id"].map(base._norm_id)
     merged = (
         left.merge(pmap[["plant_id", "energy_gj"]], on="plant_id", how="left")
-        .merge(cmap[["plant_id", "cc_capex_per_year", "cc_opex_per_t", "cc_ele1_per_t", "cc_ele2_per_t"]], on="plant_id", how="left")
     )
 
     req_cols = [
@@ -175,28 +183,56 @@ def _compute_cc_counterfactual_rows(df: pd.DataFrame, plants_map: pd.DataFrame, 
         blend = float(pd.to_numeric(r.get("blend_ratio"), errors="coerce") or 0.0)
 
         energy = float(pd.to_numeric(r.get("energy_gj"), errors="coerce") or 0.0)
-        capex = float(pd.to_numeric(r.get("cc_capex_per_year"), errors="coerce") or 0.0)
-        opex = float(pd.to_numeric(r.get("cc_opex_per_t"), errors="coerce") or 0.0)
-        ele1 = float(pd.to_numeric(r.get("cc_ele1_per_t"), errors="coerce") or 0.0)
-        ele2 = float(pd.to_numeric(r.get("cc_ele2_per_t"), errors="coerce") or 0.0)
+        # scenario-adjusted CC coefficients as used in the optimization (written to the results sheets)
+        capex = float(r["cc_fixed_cost_if_adopted"])  # annualized capex + fixed O&M
+        opex = float(r["cc_opex_per_t"])
+        ele1 = float(r["cc_ele1_per_t"])
+        ele2 = float(r["cc_ele2_per_t"])
 
         # Use the same capture structure as the optimization model.
         br_xcc = blend * x_cc
         br_xec_cc = blend * x_ec_cc
 
-        a_base = 0.9 * energy * (0.0901 * x_cc + (0.112 - 0.0901) * br_xcc)
-        a_with = a_base - 0.2 * 0.9 * energy * (0.0901 * x_ec_cc + (0.112 - 0.0901) * br_xec_cc)
-        a_noec = a_base
+        s_ec = float(r["ec_saving_ratio"])
+        rate = float(r["cc_capture_rate"])
+        ef_c = base.EF_COAL_T_PER_GJ
+        ef_d = base.EF_BIOMASS_T_PER_GJ - base.EF_COAL_T_PER_GJ
+        a_base = rate * energy * (ef_c * x_cc + ef_d * br_xcc)
 
-        cap_no_ec_part_with = 0.9 * energy * (
-            0.0901 * (x_cc - x_ec_cc) + (0.112 - 0.0901) * (br_xcc - br_xec_cc)
+        cap_no_ec_part_with = rate * energy * (
+            ef_c * (x_cc - x_ec_cc) + ef_d * (br_xcc - br_xec_cc)
         )
-        cap_with_ec_part = 0.8 * 0.9 * energy * (
-            0.0901 * x_ec_cc + (0.112 - 0.0901) * br_xec_cc
+        cap_with_ec_part = (1.0 - s_ec) * rate * energy * (
+            ef_c * x_ec_cc + ef_d * br_xec_cc
         )
+        base_with = cap_no_ec_part_with + cap_with_ec_part  # base capture (flue gas of the original fuel)
 
-        c_with = capex * x_cc + opex * a_with + ele1 * cap_no_ec_part_with + ele2 * cap_with_ec_part
-        c_noec = capex * x_cc + opex * a_noec + ele1 * a_noec
+        # Avoided accounting: the flue gas of the extra coal fired for the capture energy is captured too
+        # (factor f0, fec = with EC, penalty (1 - s) p); the abatement is net of its uncaptured share.
+        f0 = float(pd.to_numeric(r.get("cc_penalty_capture_factor"), errors="coerce") or 1.0)
+        penalty = f0 > 1.0 + 1e-12
+        if penalty:
+            p = (1.0 - 1.0 / f0) / (rate * ef_c)
+            fec = 1.0 / (1.0 - rate * ef_c * p * (1.0 - s_ec))
+        else:
+            f0 = fec = 1.0
+        q_with = f0 * cap_no_ec_part_with + fec * cap_with_ec_part
+        q_noec = f0 * a_base
+        net = (lambda q, qb: q - (q - qb) / rate) if penalty else (lambda q, qb: q)
+        a_with = net(q_with, base_with)
+        a_noec = net(q_noec, a_base)
+
+        # CO2 transport and storage are proportional to the captured volume (plant-specific cost per tonne).
+        ts_cost = float(pd.to_numeric(r.get("co2_transport_cost"), errors="coerce") or 0.0) + float(
+            pd.to_numeric(r.get("co2_storage_cost"), errors="coerce") or 0.0
+        )
+        ts_per_t = ts_cost / q_with if q_with > 1e-12 else 0.0
+
+        c_with = (
+            capex * x_cc + opex * q_with + ele1 * f0 * cap_no_ec_part_with + ele2 * fec * cap_with_ec_part
+            + ts_per_t * q_with
+        )
+        c_noec = capex * x_cc + opex * q_noec + ele1 * q_noec + ts_per_t * q_noec
 
         u_with = _safe_uac(c_with, a_with)
         u_noec = _safe_uac(c_noec, a_noec)
@@ -242,6 +278,10 @@ def _summarize_per_target(plant_df: pd.DataFrame) -> pd.DataFrame:
                 "target_id": target_id,
                 "target_abatement": float(pd.to_numeric(g["target_abatement"], errors="coerce").median()),
                 "n_plants": int(len(g)),
+                # plants where EC actually changes the downstream technology (x_ec = 1 for BC, x_ec_cc = 1 for CC)
+                "n_affected": int(
+                    (pd.to_numeric(g["x_ec"] if tech == "BC" else g["x_ec_cc"], errors="coerce").fillna(0) > 0.5).sum()
+                ),
                 "median_delta_uac": float(np.nanmedian(g["delta_uac"])),
                 "p90_abs_delta_uac": float(np.nanpercentile(np.abs(g["delta_uac"]), 90)),
                 "sum_cost_component": float(np.nansum(g["delta_uac_cost_numerator"])),

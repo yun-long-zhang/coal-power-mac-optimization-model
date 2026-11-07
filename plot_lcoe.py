@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+_RNG = np.random.default_rng(20260101)
 
 from plot_export_utils import save_figure_bundle
 
@@ -13,9 +14,9 @@ RMB_PER_USD = 6.8985
 YEAR_SCALE = 0.966  # Year conversion factor for fleet LCOE (coal retirements)
 DATA_DIR = "data"
 INPUT_WORKBOOK = "1885_coal_power_plants_original.xlsx"
-RESULTS_WORKBOOK = "gurobi_original_results.xlsx"
-OUTPUT_XLSX = "gurobi_lcoe_by_target.xlsx"
-OUTPUT_CSV = "gurobi_lcoe_summary.csv"
+RESULTS_WORKBOOK = "gurobi_r2_base_results.xlsx"
+OUTPUT_XLSX = "gurobi_r2_lcoe_by_target.xlsx"
+OUTPUT_CSV = "gurobi_r2_lcoe_summary.csv"
 OUTPUT_PNG = "fig_lcoe_distribution.png"
 
 # Targets for the scatter-boxplot figure
@@ -226,7 +227,7 @@ def plot_lcoe_box_scatter(
             arr_sub = arr[::step]
         else:
             arr_sub = arr
-        jitter = np.random.uniform(-0.03, 0.03, size=len(arr_sub))
+        jitter = _RNG.uniform(-0.03, 0.03, size=len(arr_sub))  # fixed seed: reproducible dot positions
         ax.scatter(
             x + jitter, arr_sub,
             s=4, alpha=0.25, color=TARGET_COLORS[idx],

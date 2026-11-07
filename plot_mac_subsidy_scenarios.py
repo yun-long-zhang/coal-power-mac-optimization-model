@@ -11,11 +11,11 @@ from plot_export_utils import save_figure_bundle
 
 
 DATA_DIR_NAME = "data"
-BC1_CURVE = "gurobi_subsidy_scenarios_1_bc_subsidy_curve.csv"
-CC1_CURVE = "gurobi_subsidy_scenarios_1_cc_subsidy_curve.csv"
-BC2_CURVE = "gurobi_subsidy_scenarios_2_bc_subsidy_curve.csv"
-CC2_CURVE = "gurobi_subsidy_scenarios_2_cc_subsidy_curve.csv"
-BASELINE_CURVE = "gurobi_original_curve.csv"
+BC1_CURVE = "gurobi_r2_subsidy_bc_0p25_curve.csv"
+CC1_CURVE = "gurobi_r2_subsidy_cc_35_curve.csv"
+BC2_CURVE = "gurobi_r2_subsidy_bc_0p15_curve.csv"
+CC2_CURVE = "gurobi_r2_subsidy_cc_105_curve.csv"
+BASELINE_CURVE = "gurobi_r2_base_curve.csv"
 OUTPUT_PNG_NAME = "fig_mac_subsidy_scenarios.png"
 
 

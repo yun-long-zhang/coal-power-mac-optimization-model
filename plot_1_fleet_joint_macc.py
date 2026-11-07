@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from r2_result_columns import add_net_abatement_columns
+
 from plot_export_utils import save_figure_bundle, save_plotly_bundle
 
 
@@ -16,26 +18,28 @@ INPUT_PREFIX = "fleet_joint"
 DEFAULT_CURVE_SUFFIX = "_curve.csv"
 DEFAULT_LP_CURVE_SUFFIX = "_lp_curve.csv"
 DEFAULT_RESULTS_SUFFIX = "_results.xlsx"
-DEFAULT_RESULTS_FALLBACK = "gurobi_original_results.xlsx"
+DEFAULT_RESULTS_FALLBACK = "gurobi_r2_base_results.xlsx"
 DEFAULT_CURVE_FALLBACK_FILES = [
-    "gurobi_original_curve.csv",
+    "gurobi_r2_base_curve.csv",
     "gurobi_curve.csv",
 ]
 
-SENSITIVITY_PREFIX = "gurobi"
+SENSITIVITY_PREFIX = "gurobi_r2"
 SENSITIVITY_CASES = [
-    ("baseline", "Baseline", "baseline", "_original_curve.csv", "-"),
-    ("capex_m30", "CAPEX -30%", "capex", "_capex_0p70_curve.csv", "-"),
-    ("capex_p30", "CAPEX +30%", "capex", "_capex_1p30_curve.csv", "--"),
+    ("baseline", "Baseline", "baseline", "_base_curve.csv", "-"),
+    ("capex_m30", "CC CAPEX -30%", "capex", "_capex_0p70_curve.csv", "-"),
+    ("capex_p30", "CC CAPEX +30%", "capex", "_capex_1p30_curve.csv", "--"),
     ("coal_m25", "Coal -25%", "coal", "_coal_m25_curve.csv", "-"),
     ("coal_p25", "Coal +25%", "coal", "_coal_p25_curve.csv", "--"),
-    ("af5", "Discount AF 5%", "discount", "_af5_curve.csv", "-"),
-    ("af12", "Discount AF 12%", "discount", "_af12_curve.csv", "--"),
+    ("bc_capex_m30", "BC CAPEX -30%", "bc_capex", "_bc_capex_0p70_curve.csv", "-"),
+    ("bc_capex_p30", "BC CAPEX +30%", "bc_capex", "_bc_capex_1p30_curve.csv", "--"),
+    ("af5", "Discount rate 5%", "discount", "_af5_curve.csv", "-"),
+    ("af12", "Discount rate 12%", "discount", "_af12_curve.csv", "--"),
 ]
 
-BIOMASS_SENSITIVITY_PREFIX = "biomass_supply_sensitivity"
-BIOMASS_BASELINE_CURVE_NAME = "gurobi_original_curve.csv"
-BIOMASS_BASELINE_RESULTS_NAME = "gurobi_original_results.xlsx"
+BIOMASS_SENSITIVITY_PREFIX = "gurobi_r2"
+BIOMASS_BASELINE_CURVE_NAME = "gurobi_r2_base_curve.csv"
+BIOMASS_BASELINE_RESULTS_NAME = "gurobi_r2_base_results.xlsx"
 BIOMASS_SENSITIVITY_CASES = [
     ("bio_75", "Biomass supply 75%", "bio75", 0.75, "_bio_supply_75_curve.csv", "_bio_supply_75_results.xlsx", "--"),
     ("bio_50", "Biomass supply 50%", "bio50", 0.50, "_bio_supply_50_curve.csv", "_bio_supply_50_results.xlsx", "-."),
@@ -161,15 +165,15 @@ def _build_biomass_share_series(result_xlsx: str, mode: str = "MILP") -> pd.Data
 
     rows = []
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
-        needed = ["target_id", "target_abatement", "bc_abatement_ton", "total_abatement_ton"]
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
+        needed = ["target_id", "target_abatement", "bc_net_abatement_ton", "total_abatement_ton"]
         missing = [c for c in needed if c not in pdf.columns]
         if missing or pdf.empty:
             continue
 
         target_id = pd.to_numeric(pdf["target_id"], errors="coerce").iloc[0]
         target = pd.to_numeric(pdf["target_abatement"], errors="coerce").iloc[0]
-        bc_total = pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0).sum()
+        bc_total = pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0).sum()
         total_abate = pd.to_numeric(pdf["total_abatement_ton"], errors="coerce").fillna(0.0).sum()
         share = bc_total / total_abate if total_abate and np.isfinite(total_abate) else np.nan
 
@@ -186,21 +190,28 @@ def _build_biomass_share_series(result_xlsx: str, mode: str = "MILP") -> pd.Data
         else:
             ec_saving_gj = np.nan
 
+        # Extra coal burnt to supply the capture energy (avoided accounting; zero under captured accounting)
+        if "cc_penalty_coal_gj" in pdf.columns:
+            penalty_coal_gj = float(pd.to_numeric(pdf["cc_penalty_coal_gj"], errors="coerce").fillna(0.0).sum())
+        else:
+            penalty_coal_gj = 0.0
+
         rows.append(
             {
                 "sheet": sname,
                 "target_id": int(target_id) if np.isfinite(target_id) else np.nan,
                 "target_abatement": float(target) if np.isfinite(target) else np.nan,
-                "bc_abatement_ton": float(bc_total),
+                "bc_net_abatement_ton": float(bc_total),
                 "total_abatement_ton": float(total_abate),
                 "bc_share": float(share),
                 "bc_use_gj": bc_use_gj_sum,
                 "ec_saving_gj": ec_saving_gj,
+                "penalty_coal_gj": penalty_coal_gj,
             }
         )
 
     if not rows:
-        return pd.DataFrame(columns=["sheet", "target_id", "target_abatement", "bc_abatement_ton", "total_abatement_ton", "bc_share", "bc_use_gj"])
+        return pd.DataFrame(columns=["sheet", "target_id", "target_abatement", "bc_net_abatement_ton", "total_abatement_ton", "bc_share", "bc_use_gj"])
 
     out = pd.DataFrame(rows)
     out = out.sort_values(["target_abatement", "target_id"], na_position="last").reset_index(drop=True)
@@ -237,6 +248,7 @@ def _plot_sensitivity_comparison(
     color_map = {
         "baseline": "#0B1F3A",
         "capex": "#E67E22",
+        "bc_capex": "#8E44AD",
         "coal": "#C0392B",
         "discount": "#1E8449",
     }
@@ -291,7 +303,7 @@ def _plot_sensitivity_comparison(
         if not finite.any():
             continue
         ax2.plot(
-            grid[finite],
+            grid[finite] / 1e9,
             delta[finite],
             color=color_map.get(s["category"], "#7F7F7F"),
             linewidth=2.0,
@@ -299,8 +311,8 @@ def _plot_sensitivity_comparison(
             alpha=0.9,
             label=s["label"],
         )
-    ax2.set_xlabel("Target abatement (t CO$_2$)")
-    ax2.set_ylabel("Delta MAC (scenario - baseline)")
+    ax2.set_xlabel("Abatement (Gt CO$_2$ yr$^{-1}$)")
+    ax2.set_ylabel("MAC deviation from baseline (USD t CO$_2^{-1}$)")
     ax2.set_title("Marginal cost deviation from baseline")
     ax2.grid(alpha=0.2, linestyle="--")
     ax2.legend(frameon=False, ncol=2)
@@ -388,7 +400,7 @@ def _plot_biomass_sensitivity_comparison(
                 continue
             merged = pd.merge(
                 curve[["target_abatement", "total_cost", "marginal_cost_diff"]],
-                share_df[["target_abatement", "bc_share", "bc_use_gj", "ec_saving_gj"]],
+                share_df[["target_abatement", "bc_share", "bc_use_gj", "ec_saving_gj", "penalty_coal_gj"]],
                 on="target_abatement",
                 how="inner",
             ).sort_values("target_abatement").reset_index(drop=True)
@@ -557,6 +569,7 @@ def _plot_biomass_sensitivity_comparison(
     # Coal GJ = total_energy - bio_gj - ec_saving_gj
     coal_gj = total_energy_gj - bio_gj - ec_save_gj
     coal_gj = np.maximum(coal_gj, 0.0)
+    pen_gj = base_df_sorted["penalty_coal_gj"].to_numpy(dtype=float)[ok]
 
     bar_width = np.diff(x_targets, prepend=0).mean() * 0.70 if len(x_targets) > 1 else 0.5e9
     ax_mid.bar(x_targets, bio_gj, width=bar_width,
@@ -565,8 +578,11 @@ def _plot_biomass_sensitivity_comparison(
     ax_mid.bar(x_targets, coal_gj, width=bar_width,
                bottom=bio_gj, color="#BDBDBD", alpha=0.70, edgecolor="white", linewidth=0.3,
                label="Coal", zorder=3)
+    ax_mid.bar(x_targets, pen_gj, width=bar_width,
+               bottom=bio_gj + coal_gj, color="#525252", alpha=0.80, edgecolor="white", linewidth=0.3,
+               label="Extra coal for capture energy", zorder=3)
     ax_mid.bar(x_targets, ec_save_gj, width=bar_width,
-               bottom=bio_gj + coal_gj, color="#D62728", alpha=0.55, edgecolor="white", linewidth=0.3,
+               bottom=bio_gj + coal_gj + pen_gj, color="#D62728", alpha=0.55, edgecolor="white", linewidth=0.3,
                label="EC energy saving", zorder=3)
 
     # Horizontal line showing the baseline total energy ceiling
@@ -578,7 +594,7 @@ def _plot_biomass_sensitivity_comparison(
     ax_mid.set_ylabel("Fuel consumption (GJ)")
     ax_mid.set_title("", fontsize=12)
     ax_mid.grid(alpha=0.2, linestyle="--")
-    ax_mid.legend(frameon=False, ncol=3, fontsize=9)
+    ax_mid.legend(frameon=False, ncol=4, fontsize=9)
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
@@ -598,7 +614,7 @@ def _plot_fuel_standalone(data_dir: str, out_png: str) -> str:
             total_energy_gj = float(pd.to_numeric(pp_raw[energy_col[0]], errors="coerce").fillna(0.0).sum())
 
     # Load baseline share series (has bc_use_gj and ec_saving_gj)
-    xlsx = os.path.join(data_dir, "gurobi_original_results.xlsx")
+    xlsx = os.path.join(data_dir, "gurobi_r2_base_results.xlsx")
     share_df = _build_biomass_share_series(xlsx)
     if share_df.empty:
         raise ValueError("No share data for fuel standalone plot.")
@@ -608,29 +624,33 @@ def _plot_fuel_standalone(data_dir: str, out_png: str) -> str:
     bio = base["bc_use_gj"].to_numpy(dtype=float)
     ec_save = base["ec_saving_gj"].to_numpy(dtype=float)
     ok = np.isfinite(bio) & np.isfinite(ec_save)
-    x = x[ok]
-    bio = bio[ok]
-    ec_save = ec_save[ok]
+    x = x[ok] / 1e9  # Gt CO2
+    bio = bio[ok] / 1e9  # 10^9 GJ
+    ec_save = ec_save[ok] / 1e9
+    total_energy_gj = total_energy_gj / 1e9
     coal = total_energy_gj - bio - ec_save
     coal = np.maximum(coal, 0.0)
+    pen = base["penalty_coal_gj"].to_numpy(dtype=float)[ok] / 1e9
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 5.6))
-    bar_w = np.diff(x, prepend=0).mean() * 0.65 if len(x) > 1 else 0.5e9
+    bar_w = np.diff(x, prepend=0).mean() * 0.65 if len(x) > 1 else 0.5
 
     ax.bar(x, bio, width=bar_w, color="#1F77B4", alpha=0.85, edgecolor="white", linewidth=0.3,
            label="Biomass", zorder=3)
     ax.bar(x, coal, width=bar_w, bottom=bio, color="#BDBDBD", alpha=0.70, edgecolor="white", linewidth=0.3,
            label="Coal", zorder=3)
-    ax.bar(x, ec_save, width=bar_w, bottom=bio+coal, color="#D62728", alpha=0.55, edgecolor="white", linewidth=0.3,
+    ax.bar(x, pen, width=bar_w, bottom=bio+coal, color="#525252", alpha=0.80, edgecolor="white", linewidth=0.3,
+           label="Extra coal for capture energy", zorder=3)
+    ax.bar(x, ec_save, width=bar_w, bottom=bio+coal+pen, color="#D62728", alpha=0.55, edgecolor="white", linewidth=0.3,
            label="EC energy saving", zorder=3)
 
     ax.axhline(total_energy_gj, color="#D62728", linewidth=1.8, linestyle="--", alpha=0.8, zorder=4)
     ax.text(x[-1] * 0.95, total_energy_gj * 1.015,
-            f"Baseline total {total_energy_gj/1e9:.2f} GJ",
+            f"Baseline fuel input {total_energy_gj:.2f} $\\times 10^9$ GJ",
             fontsize=10, color="#D62728", ha="right", va="bottom")
 
-    ax.set_xlabel("Target abatement (t CO$_2$)", fontsize=12)
-    ax.set_ylabel("Fleet fuel consumption (GJ)", fontsize=12)
+    ax.set_xlabel("Abatement (Gt CO$_2$ yr$^{-1}$)", fontsize=12)
+    ax.set_ylabel("Fleet fuel input ($10^9$ GJ yr$^{-1}$)", fontsize=12)
     ax.set_title("", fontsize=13)
     ax.grid(alpha=0.2, linestyle="--")
     ax.legend(
@@ -982,6 +1002,9 @@ def _plot_logistics_dualaxis(milp: pd.DataFrame, out_png: str) -> None:
     y_co2_dist = pd.to_numeric(milp["weighted_co2_distance_km"], errors="coerce").to_numpy()
     y_bio_dist = pd.to_numeric(milp["weighted_transport_distance_km"], errors="coerce").to_numpy()
 
+    # a weighted CO2 distance reported for a negligible stored volume (solver round-off, < 1 t) is not a
+    # real flow: show it as zero
+    y_co2_dist = np.where(y_store < 1.0, 0.0, y_co2_dist)
     valid = np.isfinite(x) & np.isfinite(y_store) & np.isfinite(y_co2_dist) & np.isfinite(y_bio_dist)
     x = x[valid]
     y_store = y_store[valid]
@@ -997,6 +1020,8 @@ def _plot_logistics_dualaxis(milp: pd.DataFrame, out_png: str) -> None:
     y_co2_dist = y_co2_dist[order]
     y_bio_dist = y_bio_dist[order]
 
+    x = x / 1e9  # Gt CO2
+    y_store = y_store / 1e9
     fig, ax1 = plt.subplots(1, 1, figsize=(12, 5.4))
     ax2 = ax1.twinx()
 
@@ -1007,7 +1032,7 @@ def _plot_logistics_dualaxis(milp: pd.DataFrame, out_png: str) -> None:
         linewidth=2.8,
         marker="o",
         markersize=4,
-        label="Total CO2 stored",
+        label="Total CO$_2$ stored",
     )
     l2 = ax2.plot(
         x,
@@ -1017,7 +1042,7 @@ def _plot_logistics_dualaxis(milp: pd.DataFrame, out_png: str) -> None:
         linestyle="--",
         marker="s",
         markersize=3.8,
-        label="Avg CO2 transport distance",
+        label="Avg CO$_2$ transport distance",
     )
     l3 = ax2.plot(
         x,
@@ -1030,8 +1055,8 @@ def _plot_logistics_dualaxis(milp: pd.DataFrame, out_png: str) -> None:
         label="Avg biomass transport distance",
     )
 
-    ax1.set_xlabel("Target abatement (GtC$_2$)")
-    ax1.set_ylabel("Total CO2 stored (ton)", color="#2CA02C")
+    ax1.set_xlabel("Target abatement (Gt CO$_2$ yr$^{-1}$)")
+    ax1.set_ylabel("Total CO$_2$ stored (Gt CO$_2$ yr$^{-1}$)", color="#2CA02C")
     ax2.set_ylabel("Average transport distance (km)")
     ax1.tick_params(axis="y", labelcolor="#2CA02C")
     ax1.set_title("Target abatement vs storage and transport distances")
@@ -1059,9 +1084,9 @@ def _build_scenario_sorted_points(plant_df: pd.DataFrame) -> pd.DataFrame:
         "plant_id",
         "ec_abatement_ton",
         "ec_cost",
-        "bc_abatement_ton",
+        "bc_net_abatement_ton",
         "bc_cost",
-        "cc_capture_ton",
+        "cc_net_abatement_ton",
         "cc_cost",
     ]
     missing = [c for c in needed if c not in plant_df.columns]
@@ -1071,8 +1096,8 @@ def _build_scenario_sorted_points(plant_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     tech_map = [
         ("EC", "ec_abatement_ton", "ec_cost"),
-        ("BC", "bc_abatement_ton", "bc_cost"),
-        ("CC", "cc_capture_ton", "cc_cost"),
+        ("BC", "bc_net_abatement_ton", "bc_cost"),
+        ("CC", "cc_net_abatement_ton", "cc_cost"),
     ]
     for _, r in plant_df.iterrows():
         plant_id = r["plant_id"]
@@ -1113,7 +1138,7 @@ def _plot_all_scenario_sorted_macc(result_xlsx: str, out_dir: str, mode: str = "
     outputs = []
 
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
         sorted_pts = _build_scenario_sorted_points(pdf)
         if sorted_pts.empty:
             continue
@@ -1183,8 +1208,8 @@ def _build_scenario_tech_summary(result_xlsx: str, mode: str = "MILP") -> pd.Dat
     rows = []
 
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
-        needed = ["target_id", "target_abatement", "ec_abatement_ton", "bc_abatement_ton", "cc_capture_ton"]
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
+        needed = ["target_id", "target_abatement", "ec_abatement_ton", "bc_net_abatement_ton", "cc_net_abatement_ton"]
         missing = [c for c in needed if c not in pdf.columns]
         if missing or pdf.empty:
             continue
@@ -1192,8 +1217,8 @@ def _build_scenario_tech_summary(result_xlsx: str, mode: str = "MILP") -> pd.Dat
         target_id = pd.to_numeric(pdf["target_id"], errors="coerce").iloc[0]
         target = pd.to_numeric(pdf["target_abatement"], errors="coerce").iloc[0]
         ec_total = pd.to_numeric(pdf["ec_abatement_ton"], errors="coerce").fillna(0.0).sum()
-        bc_total = pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0).sum()
-        cc_total = pd.to_numeric(pdf["cc_capture_ton"], errors="coerce").fillna(0.0).sum()
+        bc_total = pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0).sum()
+        cc_total = pd.to_numeric(pdf["cc_net_abatement_ton"], errors="coerce").fillna(0.0).sum()
 
         rows.append(
             {
@@ -1342,7 +1367,7 @@ def _load_state_assignments(
 
     rows = []
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
         need = ["plant_id", "x_ec", "x_cc", "blend_ratio", "target_id", "target_abatement"]
         missing = [c for c in need if c not in pdf.columns]
         if missing or pdf.empty:
@@ -1437,8 +1462,8 @@ def _build_tech_share_split_series(
 
     rows = []
     for sname in plant_sheets:
-        pdf = pd.read_excel(result_xlsx, sheet_name=sname)
-        need = ["target_id", "target_abatement", "ec_abatement_ton", "bc_abatement_ton", "cc_capture_ton", "blend_ratio"]
+        pdf = add_net_abatement_columns(pd.read_excel(result_xlsx, sheet_name=sname))
+        need = ["target_id", "target_abatement", "ec_abatement_ton", "bc_net_abatement_ton", "cc_net_abatement_ton", "blend_ratio"]
         missing = [c for c in need if c not in pdf.columns]
         if missing or pdf.empty:
             continue
@@ -1449,8 +1474,8 @@ def _build_tech_share_split_series(
             continue
 
         ec = pd.to_numeric(pdf["ec_abatement_ton"], errors="coerce").fillna(0.0)
-        cc = pd.to_numeric(pdf["cc_capture_ton"], errors="coerce").fillna(0.0)
-        bc = pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0)
+        cc = pd.to_numeric(pdf["cc_net_abatement_ton"], errors="coerce").fillna(0.0)
+        bc = pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0)
         br = pd.to_numeric(pdf["blend_ratio"], errors="coerce").fillna(0.0)
 
         db_mask = (br > bc_threshold) & (br <= bc_split_ratio_threshold)

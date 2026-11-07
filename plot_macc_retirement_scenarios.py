@@ -11,10 +11,10 @@ from plot_export_utils import save_figure_bundle
 
 
 DATA_DIR_NAME = "data"
-BASELINE_CURVE_NAME = "gurobi_original_curve.csv"
+BASELINE_CURVE_NAME = "gurobi_r2_base_curve.csv"
 DEFAULT_YEARS = [2030, 2035, 2040, 2045]
 DEFAULT_AGE_LIMITS = [40, 30]
-DEFAULT_PREFIX = "gurobi"
+DEFAULT_PREFIX = "gurobi_r2"
 OUTPUT_PNG_NAME = "fig_macc_retirement_scenarios.png"
 
 
@@ -41,7 +41,7 @@ def _load_curve(path: str, label: str) -> pd.DataFrame:
 
 
 def _scenario_curve_path(data_dir: str, prefix: str, age_limit: int, year: int) -> str:
-    return os.path.join(data_dir, f"{prefix}_{age_limit}_{year}_curve.csv")
+    return os.path.join(data_dir, f"{prefix}_t{age_limit}_{year}_curve.csv")
 
 
 def _build_style_maps(years: List[int]) -> Tuple[Dict[int, str], Dict[int, str]]:

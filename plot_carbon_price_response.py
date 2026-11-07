@@ -22,30 +22,39 @@ from plot_export_utils import save_figure_bundle
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.path.join(SCRIPT_DIR, "data")
 
-CURVE_CSV        = os.path.join(DATA_DIR, "gurobi_original_curve.csv")
+CURVE_CSV        = os.path.join(DATA_DIR, "gurobi_r2_base_curve.csv")
 INTERVALS_CSV    = os.path.join(DATA_DIR, "carbon_price_response_main_step_intervals.csv")
 RESPONSE_CSV     = os.path.join(DATA_DIR, "carbon_price_response_main_response_grid.csv")
 PLANT_LEVEL_CSV  = os.path.join(DATA_DIR, "uac_interaction_decomp_plant_level.csv")
 
 OUT_PNG  = os.path.join(DATA_DIR, "fig_carbon_price_response.png")
 
-# ── constants ─────────────────────────────────────────────────────────────────
-MAX_ABATEMENT_GT = 4.7          # fleet maximum (GtCO₂)
+# ── constants derived from the baseline MAC curve ──────────────────────────────
 TOTAL_PLANTS     = 1885
+WORKBOOK         = os.path.join(DATA_DIR, "1885_coal_power_plants_original.xlsx")
 
-# Reference carbon prices
-# Net-zero target: 3.6 GtCO₂ is first triggered at p = $56.04/tCO₂
-#   (from step_intervals row 26: p_low=56.036, A_star=3.60 GT)
+
+def _derive_constants():
+    c = pd.read_csv(CURVE_CSV).sort_values("achieved_abatement").reset_index(drop=True)
+    mac = c["total_cost"].diff() / c["achieved_abatement"].diff()
+    e0 = float(pd.read_excel(WORKBOOK, sheet_name="coal_plant_i")["carbon_emissions_ton"].sum())
+    bc_on = float(mac[c["total_biomass_use_gj"] > 1e-6].iloc[0])
+    cc_on = float(mac[c["cc_adoption_sum"] > 0.5].iloc[0])
+    k_nz = int(c.index[c["achieved_abatement"] >= e0][0])
+    return (float(c["achieved_abatement"].max()) / 1e9, bc_on, cc_on, float(mac[k_nz]),
+            float(c.loc[k_nz, "achieved_abatement"]) / 1e9, float(mac.iloc[-1]))
+
+
+MAX_ABATEMENT_GT, BC_ONSET_PRICE, CC_ONSET_PRICE, NET_ZERO_PRICE, NET_ZERO_GT, MAX_MAC = _derive_constants()
+PRICE_XMAX = float(np.ceil(MAX_MAC / 10.0) * 10.0 + 10.0)  # x-axis right limit
+
+# Reference carbon prices (2025 averages) and the net-zero price of the baseline curve
 REF_PRICES = [
-    (9,   "China ETS 2025\n($9/tCO\u2082)",     "#c0392b", "-"),
-    (56,  "Net-zero target\n(3.5 GtCO\u2082)",    "#27ae60", "-."),
-    (83,   "EU ETS 2025\n($83/tCO\u2082)",  "#e67e22", "--"),
+    (9.0,  "China ETS 2025", "#c0392b", "-"),
+    (66.0, "UK ETS 2025", "#8e44ad", ":"),
+    (NET_ZERO_PRICE, "Net-zero", "#27ae60", "-."),
+    (83.0, "EU ETS 2025", "#e67e22", "--"),
 ]
-
-# Phase boundaries (from curve data analysis)
-BC_ONSET_PRICE  = 2.73    # $/tCO₂  — first step in intervals (BC starts)
-CC_ONSET_PRICE  = 28.66   # $/tCO₂  — CC first appears (5 plants)
-PRICE_XMAX      = 130.0   # x-axis right limit
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -120,7 +129,8 @@ def make_figure():
                     alpha=0.85, zorder=0)
 
     # Zero-price baseline: A*(0)
-    baseline_gt = float(intervals.iloc[0]["A_star"]) / 1e9
+    # A*(0): optimal abatement without a carbon price (the cost-minimizing node)
+    baseline_gt = float(np.interp(0.0, response["carbon_price"], response["A_star"])) / 1e9
     ax_main.axhline(baseline_gt, color="#6c757d", linewidth=1.1, linestyle=":",
                     zorder=1, label=f"Zero-price baseline ({baseline_gt:.1f} GtCO\u2082)")
 
@@ -128,10 +138,11 @@ def make_figure():
     ax_main.step(px, ay, where="post", color="#1a5276", linewidth=2.4,
                  zorder=3, label="Optimal abatement $A^*(p)$")
 
-    # BC onset marker
-    ax_main.axvline(BC_ONSET_PRICE, color="#7d6608", linewidth=1.0,
+    # BC onset marker (omitted when BC is already deployed at zero carbon price)
+    if BC_ONSET_PRICE > 0:
+      ax_main.axvline(BC_ONSET_PRICE, color="#7d6608", linewidth=1.0,
                     linestyle="--", alpha=0.7, zorder=2)
-    ax_main.text(BC_ONSET_PRICE + 0.8, ymin + 0.18,
+      ax_main.text(BC_ONSET_PRICE + 0.8, ymin + 0.18,
                  f"BC onset\n\${BC_ONSET_PRICE:.1f}/tCO\u2082",
                  fontsize=7.2, color="#7d6608", va="bottom", ha="left",
                  style="italic", zorder=5)
@@ -145,15 +156,15 @@ def make_figure():
                  style="italic", zorder=5)
 
     # Reference price lines + annotations
-    ann_y_offsets = {14.0: 0.0, 16.5: 0.42, 56.04: 0.0}
-    for p_ref, label, color, ls in REF_PRICES:
+    ann_y_offsets = [0.0, -0.55, 0.0, 0.35]  # staggered labels for the four reference prices
+    for i_ref, (p_ref, label, color, ls) in enumerate(REF_PRICES):
         t = _tech_at_price(p_ref, intervals, curve)
         a_gt = t["abatement_gt"]
         pct  = a_gt / MAX_ABATEMENT_GT * 100
         ax_main.axvline(p_ref, color=color, linewidth=1.6, linestyle=ls, zorder=4)
         ax_main.scatter([p_ref], [a_gt], s=55, color=color, zorder=6, clip_on=False)
         x_offset = 2.2 if p_ref < 30 else 2.5
-        y_extra  = ann_y_offsets.get(p_ref, 0.0)
+        y_extra  = ann_y_offsets[i_ref]
         ax_main.annotate(
             f"$p$={p_ref:.0f}: $A^*$={a_gt:.2f} Gt\n({pct:.0f}% of fleet max)",
             xy=(p_ref, a_gt),
@@ -180,7 +191,7 @@ def make_figure():
     ax_main.axhline(MAX_ABATEMENT_GT, color="#922b21", linewidth=0.9,
                     linestyle=":", alpha=0.6, zorder=1)
     ax_main.text(PRICE_XMAX - 1, MAX_ABATEMENT_GT + 0.05,
-                 f"Fleet max = {MAX_ABATEMENT_GT} Gt",
+                 f"Fleet max = {MAX_ABATEMENT_GT:.2f} Gt",
                  ha="right", va="bottom", fontsize=7.5, color="#922b21")
 
     # Legend
@@ -192,10 +203,12 @@ def make_figure():
                label=f"Zero-price baseline ({baseline_gt:.1f} GtCO\u2082)"),
         Line2D([0], [0], color="#c0392b", lw=1.5, ls="-",
                label="China ETS 2025 (\$9/tCO\u2082)"),
+        Line2D([0], [0], color="#8e44ad", lw=1.5, ls=":",
+               label="UK ETS 2025 (\$66/tCO\u2082)"),
         Line2D([0], [0], color="#e67e22", lw=1.5, ls="--",
                label="EU ETS 2025 (\$83/tCO\u2082)"),
         Line2D([0], [0], color="#27ae60", lw=1.5, ls="-.",
-               label="Net-zero target: 3.6 GtCO\u2082 (\$56/tCO\u2082)"),
+               label=f"Net-zero: {NET_ZERO_GT:.1f} GtCO\u2082 (\${NET_ZERO_PRICE:.0f}/tCO\u2082)"),
     ]
     ax_main.legend(handles=legend_handles, loc="lower right", fontsize=7.4,
                    frameon=True, framealpha=0.92, edgecolor="#cccccc",
@@ -216,14 +229,19 @@ def make_figure():
     # Panel (b): Technology deployment at selected carbon price levels
     # Grouped bars: EC (orange) + BC (green) + CC (blue) — all in plant counts
     # ═══════════════════════════════════════════════════════════════════════════
-    key_prices_b = [0.0, 9.0, 28.66, 56.04, 83.0, 124.5]
-    bar_labels_b = [
-        "$0", "$9",
-        "$28.7\n(CC onset)",
-        "$56\n(net-zero)",
-        "$83\n(EU ETS 2025)",
-        "$125\n(fleet max)",
-    ]
+    # At a switching price both neighbouring solutions are optimal; evaluate just above it so that the
+    # bar shows the portfolio that the price unlocks.
+    eps = 1e-3
+    key_b = sorted([
+        (0.0, "$0"), (9.0, "$9\n(China ETS 2025)"),
+        (CC_ONSET_PRICE + eps, f"${CC_ONSET_PRICE:.1f}\n(CC onset)"),
+        (66.0, "$66\n(UK ETS 2025)"),
+        (NET_ZERO_PRICE + eps, f"${NET_ZERO_PRICE:.0f}\n(net-zero)"),
+        (83.0, "$83\n(EU ETS 2025)"),
+        (MAX_MAC + eps, f"${MAX_MAC:.0f}\n(fleet max)"),
+    ])
+    key_prices_b = [k for k, _ in key_b]
+    bar_labels_b = [lab for _, lab in key_b]
 
     tech_rows_b = []
     for p in key_prices_b:

@@ -1,28 +1,11 @@
-# Python
+# outputs created when the code is run
+figures/
+logs/
+data/EC_Portfolio/
+data/ec_packages_r2.csv
+data/gurobi_r2_*
+data/sequence_falsification_*
+data/*.png
+data/*.pdf
 __pycache__/
-backup/
-repec/
-other/
-*.pyc
-.env/
-.venv/
-
-# Data files (large)
-*.xlsx
-*.csv
-*.docx
-
-# Output figures & temp
-*.png
-*.jpg
-*.pdf
-data/*.csv
-data/*.xlsx
-
-# System
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
+logs_r2/

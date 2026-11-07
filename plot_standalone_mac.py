@@ -5,8 +5,11 @@ unit abatement cost and picks cheapest units per target.
 
 Inputs:
   data/1885_coal_power_plants_original.xlsx → EC sheet (carbon_reduction, unit_cost)
-  data/gurobi_bc_only_results.xlsx          → pm03 (max target: BC abatement & cost)
-  data/gurobi_cc_only_max_results.xlsx      → pm34 (max target: CC capture & cost)
+  gurobi_r2_bc_only_results.xlsx           → last pm sheet (max target: BC abatement & cost)
+  gurobi_r2_cc_only[_max]_results.xlsx     → last pm sheet (max target: CC abatement & cost)
+  Both are read from the result-set folder (R2_SET_DIR) when it holds them, else from data/.
+  Abatement is net (BC minus biomass logistics emissions, CC net of the capture-energy coal), as in the
+  fleet model; under the captured accounting the two deductions are zero.
 """
 
 import os
@@ -19,12 +22,26 @@ import numpy as np
 import pandas as pd
 
 from plot_export_utils import save_figure_bundle
+from r2_result_columns import add_net_abatement_columns
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 WORKBOOK = DATA_DIR / "1885_coal_power_plants_original.xlsx"
-BC_RESULTS = DATA_DIR / "gurobi_bc_only_results.xlsx"
-CC_RESULTS = DATA_DIR / "gurobi_cc_only_max_results.xlsx"
+_SET_DIR = Path(os.environ.get("R2_SET_DIR", str(DATA_DIR)))
+
+
+def _set_file(*names: str) -> Path:
+    for folder in (_SET_DIR, DATA_DIR):
+        for name in names:
+            if (folder / name).exists():
+                return folder / name
+    return DATA_DIR / names[0]
+
+
+BC_RESULTS = _set_file("gurobi_r2_bc_only_results.xlsx")
+CC_RESULTS = _set_file("gurobi_r2_cc_only_results.xlsx", "gurobi_r2_cc_only_max_results.xlsx")
+EC_PACKAGES = DATA_DIR / "ec_packages_r2.csv"
+EC_PACKAGE = "r20_o00" if os.environ.get("R2_SET", "ec10") == "ec20" else "no5_r10_o00"  # baseline EC package of the result set
 OUTPUT_CSV = DATA_DIR / "standalone_mac_curve.csv"
 OUTPUT_PNG = DATA_DIR / "fig_standalone_mac.png"
 OUTPUT_RAW_PNG = DATA_DIR / "fig_standalone_mac_raw.png"
@@ -51,28 +68,34 @@ def _norm_id(v) -> str:
 
 
 def load_ec_data() -> pd.DataFrame:
-    """Load EC per-plant abatement potential and unit cost from workbook."""
-    ec = pd.read_excel(WORKBOOK, sheet_name="EC")
+    """Load the baseline EC package (net annual cost, i.e. after avoided coal cost), as in the fleet model."""
+    pk = pd.read_csv(EC_PACKAGES, dtype={"plant_id": str})
+    pk = pk[pk["package"] == EC_PACKAGE]
     out = pd.DataFrame({
-        "plant_id": ec["plant_i"].map(_norm_id),
+        "plant_id": pk["plant_id"].map(_norm_id),
         "tech": "EC",
-        "abatement_ton": pd.to_numeric(ec["carbon_reduction"], errors="coerce").fillna(0.0),
-        "unit_cost_per_ton": pd.to_numeric(ec["unit _cost"], errors="coerce").fillna(0.0),
+        "abatement_ton": pk["ec_abatement_ton"].astype(float),
+        "total_cost": pk["ec_net_cost"].astype(float),
     })
-    out["total_cost"] = out["abatement_ton"] * out["unit_cost_per_ton"]
+    out["unit_cost_per_ton"] = out["total_cost"] / out["abatement_ton"].replace(0, np.nan)
     return out
+
+
+def _last_pm_sheet(path) -> str:
+    sheets = [s for s in pd.ExcelFile(path).sheet_names if s.startswith("pm")]
+    return max(sheets, key=lambda x: int(x[2:]))  # maximum target
 
 
 def load_bc_data() -> pd.DataFrame:
     """Load BC per-plant abatement from the max-target pm sheet.
     Includes coal savings: bc_total_cost = bc_investment - bc_coal_saving + bc_feedstock + bc_transport
     This matches the actual net cost of BC in the joint optimization model."""
-    pdf = pd.read_excel(BC_RESULTS, sheet_name="pm03")  # sheet 3 = max target
+    pdf = add_net_abatement_columns(pd.read_excel(BC_RESULTS, sheet_name=_last_pm_sheet(BC_RESULTS)))
     out = pd.DataFrame({
         "plant_id": pdf["plant_id"].astype(str),
         "tech": "BC",
-        "abatement_ton": pd.to_numeric(pdf["bc_abatement_ton"], errors="coerce").fillna(0.0),
-        "total_cost": pd.to_numeric(pdf["bc_total_cost"], errors="coerce").fillna(0.0),
+        "abatement_ton": pd.to_numeric(pdf["bc_net_abatement_ton"], errors="coerce").fillna(0.0),
+        "total_cost": pd.to_numeric(pdf["bc_total_cost" if "bc_total_cost" in pdf.columns else "total_cost"], errors="coerce").fillna(0.0),
     })
     out["unit_cost_per_ton"] = out["total_cost"] / out["abatement_ton"].replace(0, np.nan)
     return out
@@ -80,12 +103,13 @@ def load_bc_data() -> pd.DataFrame:
 
 def load_cc_data() -> pd.DataFrame:
     """Load CC per-plant capture from the max-target pm sheet."""
-    pdf = pd.read_excel(CC_RESULTS, sheet_name="pm34")  # sheet 34 = max target
+    pdf = add_net_abatement_columns(pd.read_excel(CC_RESULTS, sheet_name=_last_pm_sheet(CC_RESULTS)))
     out = pd.DataFrame({
         "plant_id": pdf["plant_id"].astype(str),
         "tech": "CC",
-        "abatement_ton": pd.to_numeric(pdf["cc_capture_ton"], errors="coerce").fillna(0.0),
-        "total_cost": pd.to_numeric(pdf["cc_cost"], errors="coerce").fillna(0.0),
+        "abatement_ton": pd.to_numeric(pdf["cc_net_abatement_ton"], errors="coerce").fillna(0.0),
+        # capture cost plus CO2 transport and storage, as in the fleet model
+        "total_cost": pd.to_numeric(pdf["total_cost"], errors="coerce").fillna(0.0),
     })
     out["unit_cost_per_ton"] = out["total_cost"] / out["abatement_ton"].replace(0, np.nan)
     return out
@@ -220,7 +244,7 @@ def plot_mac(df: pd.DataFrame, units: pd.DataFrame, out_path: str) -> None:
         out_path,
         dpi=320,
         bbox_inches="tight",
-        data_frames={"curve": curve, "sorted_units": sorted_units},
+        data_frames={"curve": df, "sorted_units": units},
     )
     plt.close(fig)
     print(f"Plot saved: {out_path}")

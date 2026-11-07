@@ -9,9 +9,9 @@ import pandas as pd
 
 # ---- User config (edit before running) ----
 DATA_DIR_NAME = "data"
-INPUT_CURVE_NAME = "gurobi_original_curve.csv"
+INPUT_CURVE_NAME = "gurobi_r2_base_curve.csv"
 OUTPUT_PREFIX = "carbon_price_response"
-DEFAULT_REFERENCE_PRICES = [9.0, 56.04, 83.0]
+DEFAULT_REFERENCE_PRICES = [9.0, 66.0, 83.0]  # China, UK, EU ETS 2025 averages (USD/t)
 # ------------------------------------------
 
 
@@ -211,7 +211,7 @@ def main() -> None:
             "Build carbon-price response A*(p) from a TAC curve by solving min_k [TAC_k - p * A_k]."
         )
     )
-    parser.add_argument("--curve", default=None, help="Input curve CSV path. Default: data/gurobi_original_curve.csv")
+    parser.add_argument("--curve", default=None, help="Input curve CSV path. Default: data/gurobi_r2_base_curve.csv")
     parser.add_argument(
         "--abatement-col",
         choices=["achieved_abatement", "target_abatement"],

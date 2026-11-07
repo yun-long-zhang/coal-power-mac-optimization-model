@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from gurobipy import GRB
 
-import optimization_fleet_joint_milp_persistent as base
+import optimization_1_fleet_joint_milp_persistent as base
 
 
 # ---- User config (edit before running) ----
@@ -115,7 +115,7 @@ def _build_solver_contexts_with_policy(
     if target_match_mode == "min_overshoot":
         contexts["stage1"] = _build_one("abatement")
         contexts["stage2"] = _build_one("cost")
-    elif target_match_mode == "cost_only":
+    elif target_match_mode in ("cost_only", "equality"):
         contexts["single"] = _build_one("cost")
     else:
         raise ValueError(f"Unsupported target_match_mode: {target_match_mode}")
@@ -237,7 +237,10 @@ def build_gap_tables(curves: pd.DataFrame, reference_policy: str) -> Tuple[pd.Da
     )
 
     joined = curves.merge(ref, on=["target_id", "target_abatement"], how="left")
-    joined["both_optimal"] = (joined["status"] == "Optimal") & (joined["status_ref"] == "Optimal")
+    # Optimal, or time-limited with an accepted near-optimal incumbent (cost reported).
+    ok = joined["status"].isin(["Optimal", "TimeLimit"]) & joined["total_cost"].notna()
+    ok_ref = joined["status_ref"].isin(["Optimal", "TimeLimit"]) & joined["total_cost_ref"].notna()
+    joined["both_optimal"] = ok & ok_ref
 
     joined["gap_abs_vs_ref"] = np.where(
         joined["both_optimal"],
@@ -324,7 +327,7 @@ def main() -> None:
     parser.add_argument("--time-limit-sec", type=float, default=base.SOLVER_TIME_LIMIT_SEC)
     parser.add_argument("--mip-gap", type=float, default=base.SOLVER_MIP_GAP)
     parser.add_argument("--solver-threads", type=int, default=base.SOLVER_THREADS)
-    parser.add_argument("--target-match-mode", choices=["min_overshoot", "cost_only"], default="min_overshoot")
+    parser.add_argument("--target-match-mode", choices=["equality", "min_overshoot", "cost_only"], default=base.TARGET_MATCH_MODE)
     parser.add_argument("--target-mode-switch-abatement", type=float, default=None)
     parser.add_argument("--target-start-index", type=int, default=1, help="1-based start index for slicing the target grid.")
     parser.add_argument("--target-end-index", type=int, default=None, help="1-based inclusive end index for slicing the target grid.")
@@ -333,6 +336,8 @@ def main() -> None:
     parser.add_argument("--reference-policy", default=DEFAULT_REFERENCE_POLICY, help="Policy used as TAC optimum benchmark.")
     parser.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX, help="Output prefix under data/.")
     parser.add_argument("--no-gurobi", action="store_true", help="Use CBC instead of Gurobi (not recommended for this script).")
+    parser.add_argument("--ec-package", default=base.EC_PACKAGE, help="EC package tag (same as the fleet model).")
+    parser.add_argument("--ec-package-file", default=None, help="EC package CSV. Default: data/ec_packages_r2.csv")
     args = parser.parse_args()
 
     _validate_policies(args.policies)
@@ -350,6 +355,13 @@ def main() -> None:
         distance_path,
         co2_distance_path,
     )
+    if args.ec_package:
+        ec = base.apply_ec_package(ec, args.ec_package_file or os.path.join(data_dir, base.EC_PACKAGE_FILE_NAME), args.ec_package)
+    plants, ec, cc, biomass = base.apply_input_scenario(
+        workbook_path=input_path, plants=plants, ec=ec, cc=cc, biomass=biomass, coal_factor=1.0, discount_case="base",
+        cc_capex_factor=1.0, biomass_supply_factor=1.0, cc_capture_rate=base.BASE_CC_CAPTURE_RATE,
+        scenario_year=None, retirement_age=30.0,
+    )
     model_data = base.build_model_data(
         plants=plants,
         ec=ec,
@@ -366,6 +378,11 @@ def main() -> None:
         co2_transport_cost_per_ton_km=args.co2_transport_cost_per_ton_km,
         co2_storage_cost_per_ton=args.co2_storage_cost_per_ton,
         biomass_feedstock_cost_per_gj=args.biomass_feedstock_cost_per_gj,
+    )
+    model_data = base.apply_model_scenario(
+        model_data, cc_capture_rate=base.BASE_CC_CAPTURE_RATE, bc_subsidy_rmb_per_kwh=0.0, cc_subsidy_rmb_per_ton=0.0,
+        disable_ec=False, disable_ec_interactions=False, disable_bc_cc_interaction=False,
+        storage_injection_years=base.STORAGE_INJECTION_YEARS,
     )
 
     if args.targets_from_curve:
@@ -423,6 +440,14 @@ def main() -> None:
     curves_all = []
     for policy in args.policies:
         print("\n" + "=" * 90)
+        # per-policy checkpoint: a completed policy is reloaded instead of re-solved after an interruption
+        ckpt = os.path.join(data_dir, f"{args.output_prefix}_checkpoint_{policy}.csv")
+        if os.path.exists(ckpt):
+            done = pd.read_csv(ckpt)
+            if len(done) == len(targets) and np.allclose(np.sort(done["target_abatement"].to_numpy(float)), targets):
+                print(f"Policy {policy}: loaded completed checkpoint {ckpt}")
+                curves_all.append(done)
+                continue
         print(f"Running policy: {policy}")
         curve = run_sweep_for_policy(
             model_data=model_data,
@@ -438,6 +463,7 @@ def main() -> None:
             threads=args.solver_threads,
             policy=policy,
         )
+        curve.to_csv(ckpt, index=False)
         curves_all.append(curve)
 
     curves_df = pd.concat(curves_all, ignore_index=True)
