@@ -1,6 +1,6 @@
 # Interaction-aware marginal abatement cost model for China's coal-fired power fleet
 
-Code and data for *"Technology interactions reshape the economics of China's coal power decarbonization"*.
+Code and data for *"Technology interactions reshape the economics of coal power decarbonization in China"*.
 The repository reproduces all results, figures, and source-data tables of the main text and the Supplementary
 Information from the input data.
 
@@ -77,7 +77,7 @@ panel). The workbooks of the published figures are in `source_data/`:
 | Fig. 3 | `Fig3.xlsx` |
 | Fig. 4 | `Fig4.xlsx` |
 | Supplementary Figs. S9, S10 | `FigS9.xlsx`, `FigS10.xlsx` |
-| Supplementary Figs. S13–S26 | `FigS13.xlsx` … `FigS26.xlsx` |
+| Supplementary Figs. S13–S27 | `FigS13.xlsx` … `FigS27.xlsx` |
 | Supplementary Note 6, Table S9 | `Note6_policy_instruments.xlsx` |
 
 ## Input workbook
@@ -103,4 +103,9 @@ panel). The workbooks of the published figures are in `source_data/`:
 
 ## Licence and citation
 
-[Authors: licence, citation, and Zenodo DOI of this version.]
+Released under the Creative Commons Attribution 4.0 International licence (CC BY 4.0).
+
+If you use this code or data, please cite the archived version on Zenodo, https://doi.org/10.5281/zenodo.24041745
+(v2.0.0; all versions: https://doi.org/10.5281/zenodo.21526185), and the associated article, *"Technology
+interactions reshape the economics of coal power decarbonization in China"* (Zhang et al., Communications Earth &
+Environment, under review).

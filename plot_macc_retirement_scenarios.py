@@ -167,7 +167,7 @@ def main() -> None:
     ax.axhline(0.0, color="#444444", linewidth=0.9, alpha=0.7)
     ax.grid(alpha=0.22, linestyle="--")
     ax.set_xlabel("Abatement target (Gt CO$_2$)")
-    ax.set_ylabel("Marginal abatement cost (USD/tC$_2$)")
+    ax.set_ylabel("Marginal abatement cost (USD/tCO$_2$)")
     ax.set_title("MAC curves under plant retirement scenarios by lifetime")
 
     x_max = max(

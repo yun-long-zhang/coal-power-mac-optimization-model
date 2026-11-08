@@ -98,13 +98,16 @@ def main() -> None:
             if key in s.index:
                 grid[i, j] = s.loc[key, "uac"]
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    im = ax.imshow(grid, cmap="RdYlGn_r", vmin=np.nanmin(grid) - 1, vmax=np.nanmax(grid) + 1, aspect="auto")
+    # perceptually uniform colour map; cell labels switch to white on dark cells
+    im = ax.imshow(grid, cmap="viridis", vmin=np.nanmin(grid) - 1, vmax=np.nanmax(grid) + 1, aspect="auto")
     for i in range(len(overlaps)):
         for j in range(len(targets)):
             v = grid[i, j]
             # 20%: positive overlaps leave some plants below the target even with all measures; 10%: overlap not run
             missing = "infeasible" if targets[j][0] == "20" else "not evaluated"
-            ax.text(j, i, f"{v:.1f}" if np.isfinite(v) else missing, ha="center", va="center", fontsize=9)
+            r, g, b_, _ = im.cmap(im.norm(v)) if np.isfinite(v) else (1, 1, 1, 1)
+            colour = "white" if 0.299 * r + 0.587 * g + 0.114 * b_ < 0.5 else "black"
+            ax.text(j, i, f"{v:.1f}" if np.isfinite(v) else missing, ha="center", va="center", fontsize=9, color=colour)
     ax.set_xticks(range(len(targets)))
     ax.set_xticklabels([lab for _, lab in targets])
     ax.set_yticks(range(len(overlaps)))

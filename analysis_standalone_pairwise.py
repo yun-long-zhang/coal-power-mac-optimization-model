@@ -146,14 +146,19 @@ def main() -> None:
         res[f"EC{lvl}_cost"] = ec[f"ec{lvl}_cost"]
         res[f"EC{lvl}_uac"] = ec[f"ec{lvl}_cost"] / ec[f"ec{lvl}_abate"]
 
+    reachable = bio_arcs.groupby("plant_id")["supply_gj"].sum().reindex(pl.index).fillna(0.0)
+
     def bc(theta: float, inv_rmb_per_mw: float, s: pd.Series) -> pd.DataFrame:
-        bio = theta * (1.0 - s) * pl["P_gj"]  # biomass input = displaced coal energy
+        # biomass input = displaced coal energy, limited to the biomass reachable within 200 km
+        bio = np.minimum(theta * (1.0 - s) * pl["P_gj"], reachable)
         supply, logistics = _nearest_fill(bio_arcs, bio, "supply_gj", "unit_cost", "unit_ef")
         # investment per kW of capacity at the nominal co-firing ratio (unchanged by EC)
         invest = inv_rmb_per_mw * theta * pl["X_mw"] * (pl["af_bc"] + base.BC_FIXED_OM_SHARE) / base.RMB_PER_USD
         gross = invest + supply  # annual cost of BC (investment, O&M, feedstock, transport)
         net = gross - pl["coal_price"] * bio
-        return pd.DataFrame({"gross": gross, "net": net, "abate": bio * base.EF_COAL_T_PER_GJ - logistics})
+        share = bio / ((1.0 - s) * pl["P_gj"])  # co-firing ratio actually reached (theta unless biomass is short)
+        return pd.DataFrame({"gross": gross, "net": net, "abate": bio * base.EF_COAL_T_PER_GJ - logistics,
+                             "share": share})
 
     def cc(theta: float, s: pd.Series, ele_scale: pd.Series) -> pd.DataFrame:
         q_base = rate * (1.0 - s) * pl["P_gj"] * (
@@ -178,13 +183,13 @@ def main() -> None:
             b0 = bc(theta, inv, zero)
             res[f"{name}{t}_net"], res[f"{name}{t}_gross"], res[f"{name}{t}_abate"] = b0["net"], b0["gross"], b0["abate"]
             res[f"{name}{t}_uac"] = b0["net"] / b0["abate"]
-            res[f"{name}{t}_biopower_cost_per_mwh"] = b0["gross"] / (theta * pl["G_mwh"])
+            res[f"{name}{t}_biopower_cost_per_mwh"] = b0["gross"] / (b0["share"] * pl["G_mwh"])
             for lvl, s in (("10", s10), ("20", s20)):
                 b1 = bc(theta, inv, s)
                 key = f"{name}{t}_EC{lvl}"
                 res[f"{key}_uac"] = b1["net"] / b1["abate"]
                 res[f"{key}_dgen_combo"] = (ec[f"ec{lvl}_cost"] + b1["net"] - b0["net"]) / pl["G_mwh"]
-                res[f"{key}_biopower_cost_per_mwh"] = b1["gross"] / (theta * pl["G_mwh"])
+                res[f"{key}_biopower_cost_per_mwh"] = b1["gross"] / (b1["share"] * pl["G_mwh"])
         c_bc = cc(theta, zero, one)  # CC on a DB co-fired plant
         res[f"CC_DB{t}_uac"] = c_bc["cost"] / c_bc["abate"]
 
