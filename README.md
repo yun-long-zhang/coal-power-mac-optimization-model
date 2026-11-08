@@ -105,7 +105,7 @@ panel). The workbooks of the published figures are in `source_data/`:
 
 Released under the Creative Commons Attribution 4.0 International licence (CC BY 4.0).
 
-If you use this code or data, please cite the archived version on Zenodo, https://doi.org/10.5281/zenodo.24041745
-(v2.0.0; all versions: https://doi.org/10.5281/zenodo.21526185), and the associated article, *"Technology
+If you use this code or data, please cite the archived version on Zenodo, https://doi.org/10.5281/zenodo.24059516
+(v2.0.1; all versions: https://doi.org/10.5281/zenodo.21526185), and the associated article, *"Technology
 interactions reshape the economics of coal power decarbonization in China"* (Zhang et al., Communications Earth &
 Environment, under review).
